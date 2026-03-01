@@ -237,6 +237,11 @@ function replaceInDoc(doc, find, replace, caseSensitive = true) {
 
 function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
+/** Escape text for use in XML element content / attribute values. */
+function escXml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 // ── Content type helpers ──────────────────────────────────────────────────────
 
 const MIME_EXT = {
@@ -296,6 +301,198 @@ export class PptxWriter {
   /** Parse from raw ArrayBuffer or Uint8Array. */
   static async fromBytes(buffer) {
     const files = await readZip(buffer);
+    return new PptxWriter(files);
+  }
+
+  /**
+   * Create a new PPTX from scratch with a blank slide.
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.width=9144000]   slide width in EMU  (default 10in = widescreen)
+   * @param {number} [opts.height=5143500]  slide height in EMU (default ~5.63in = 16:9)
+   * @param {string} [opts.title='Presentation']
+   * @returns {PptxWriter}
+   *
+   * @example
+   *   const writer = PptxWriter.create();
+   *   writer.addTextBox(0, 'Hello World', { x: 914400, y: 914400, w: 7000000, h: 900000, fontSize: 4400 });
+   *   await writer.download('new.pptx');
+   *
+   * @example
+   *   // 4:3 aspect ratio
+   *   const writer = PptxWriter.create({ width: 9144000, height: 6858000 });
+   */
+  static create(opts = {}) {
+    const {
+      width  = 9144000,
+      height = 5143500,
+      title  = 'Presentation',
+    } = opts;
+
+    const files = {};
+
+    // ── [Content_Types].xml ──────────────────────────────────────────────
+    files['[Content_Types].xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+  <Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>
+  <Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>
+  <Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+</Types>`);
+
+    // ── _rels/.rels ──────────────────────────────────────────────────────
+    files['_rels/.rels'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+</Relationships>`);
+
+    // ── docProps/core.xml ────────────────────────────────────────────────
+    const now = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+    files['docProps/core.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+  xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:title>${escXml(title)}</dc:title>
+  <dcterms:created xsi:type="dcterms:W3CDTF">${now}</dcterms:created>
+  <dcterms:modified xsi:type="dcterms:W3CDTF">${now}</dcterms:modified>
+</cp:coreProperties>`);
+
+    // ── docProps/app.xml ─────────────────────────────────────────────────
+    files['docProps/app.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+  <Application>pptx-browser</Application>
+  <Slides>1</Slides>
+</Properties>`);
+
+    // ── ppt/presentation.xml ─────────────────────────────────────────────
+    files['ppt/presentation.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>
+  <p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst>
+  <p:sldSz cx="${width}" cy="${height}"/>
+  <p:notesSz cx="${height}" cy="${width}"/>
+</p:presentation>`);
+
+    files['ppt/_rels/presentation.xml.rels'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>
+</Relationships>`);
+
+    // ── ppt/theme/theme1.xml ─────────────────────────────────────────────
+    files['ppt/theme/theme1.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme">
+  <a:themeElements>
+    <a:clrScheme name="Office">
+      <a:dk1><a:srgbClr val="000000"/></a:dk1>
+      <a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>
+      <a:dk2><a:srgbClr val="44546A"/></a:dk2>
+      <a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>
+      <a:accent1><a:srgbClr val="4472C4"/></a:accent1>
+      <a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
+      <a:accent3><a:srgbClr val="A5A5A5"/></a:accent3>
+      <a:accent4><a:srgbClr val="FFC000"/></a:accent4>
+      <a:accent5><a:srgbClr val="5B9BD5"/></a:accent5>
+      <a:accent6><a:srgbClr val="70AD47"/></a:accent6>
+      <a:hlink><a:srgbClr val="0563C1"/></a:hlink>
+      <a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+    </a:clrScheme>
+    <a:fontScheme name="Office">
+      <a:majorFont><a:latin typeface="Calibri Light"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont>
+      <a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont>
+    </a:fontScheme>
+    <a:fmtScheme name="Office">
+      <a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst>
+      <a:lnStyleLst><a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst>
+      <a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>
+      <a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst>
+    </a:fmtScheme>
+  </a:themeElements>
+</a:theme>`);
+
+    // ── ppt/slideMasters/slideMaster1.xml ────────────────────────────────
+    files['ppt/slideMasters/slideMaster1.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:cSld>
+    <p:bg><p:bgRef idx="1001"><a:schemeClr val="bg1"/></p:bgRef></p:bg>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+    </p:spTree>
+  </p:cSld>
+  <p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>
+  <p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst>
+</p:sldMaster>`);
+
+    files['ppt/slideMasters/_rels/slideMaster1.xml.rels'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/>
+</Relationships>`);
+
+    // ── ppt/slideLayouts/slideLayout1.xml ─────────────────────────────────
+    files['ppt/slideLayouts/slideLayout1.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldLayout xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+  type="blank" preserve="1">
+  <p:cSld name="Blank">
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+    </p:spTree>
+  </p:cSld>
+  <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>
+</p:sldLayout>`);
+
+    files['ppt/slideLayouts/_rels/slideLayout1.xml.rels'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>
+</Relationships>`);
+
+    // ── ppt/slides/slide1.xml ────────────────────────────────────────────
+    files['ppt/slides/slide1.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+    </p:spTree>
+  </p:cSld>
+</p:sld>`);
+
+    files['ppt/slides/_rels/slide1.xml.rels'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+</Relationships>`);
+
     return new PptxWriter(files);
   }
 
@@ -868,6 +1065,87 @@ export class PptxWriter {
     this._savePresDoc();
     this._savePresRels();
     this._slidePaths = this._buildSlidePaths();
+    return this;
+  }
+
+  /**
+   * Add a new blank slide.
+   * @param {number} [atIdx]  insert position (default: end)
+   * @returns {PptxWriter}
+   */
+  addSlide(atIdx) {
+    const insertAt = atIdx ?? this._slidePaths.length;
+
+    // Find next available slide number
+    const nums = Object.keys(this._files)
+      .map(p => p.match(/ppt\/slides\/slide(\d+)\.xml/))
+      .filter(Boolean).map(m => parseInt(m[1], 10));
+    const nextNum = (nums.length ? Math.max(...nums) : 0) + 1;
+
+    const newSlidePath = `ppt/slides/slide${nextNum}.xml`;
+    const nsP = NS.p, nsA = NS.a;
+
+    this._files[newSlidePath] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:p="${nsP}" xmlns:a="${nsA}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+    </p:spTree>
+  </p:cSld>
+</p:sld>`);
+
+    // Point the new slide at a layout (use the first layout available)
+    const layoutTarget = Object.keys(this._files).find(p => p.match(/ppt\/slideLayouts\/slideLayout\d+\.xml/));
+    const layoutRelTarget = layoutTarget ? '../slideLayouts/' + layoutTarget.split('/').pop() : '../slideLayouts/slideLayout1.xml';
+    this._files[relsPath(newSlidePath)] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="${layoutRelTarget}"/>
+</Relationships>`);
+
+    // Add relationship in presentation.xml.rels
+    const newRId = nextRId(this._presRels);
+    this._presRels[newRId] = {
+      id: newRId,
+      type: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide',
+      target: `slides/slide${nextNum}.xml`,
+      fullPath: newSlidePath,
+    };
+    this._savePresRels();
+
+    // Add sldId to presentation.xml
+    const sldIdLst = g1(this._presDoc, 'sldIdLst');
+    if (sldIdLst) {
+      const ids = gtn(sldIdLst, 'sldId').map(el => parseInt(el.getAttribute('id') || '0', 10));
+      const nextId = (ids.length ? Math.max(...ids) : 255) + 1;
+      const sldIdEl = this._presDoc.createElementNS(NS.p, 'p:sldId');
+      sldIdEl.setAttribute('id', String(nextId));
+      sldIdEl.setAttributeNS(NS.r, 'r:id', newRId);
+
+      const children = Array.from(sldIdLst.children);
+      if (insertAt >= children.length) {
+        sldIdLst.appendChild(sldIdEl);
+      } else {
+        sldIdLst.insertBefore(sldIdEl, children[insertAt]);
+      }
+    }
+    this._savePresDoc();
+    this._slidePaths = this._buildSlidePaths();
+
+    // Add content type
+    const ctPath = '[Content_Types].xml';
+    const ctDoc  = readXml(this._files, ctPath);
+    if (ctDoc) {
+      const root = ctDoc.documentElement;
+      const ov   = ctDoc.createElementNS(NS.ct, 'Override');
+      ov.setAttribute('PartName',    '/' + newSlidePath);
+      ov.setAttribute('ContentType', 'application/vnd.openxmlformats-officedocument.presentationml.slide+xml');
+      root.appendChild(ov);
+      this._files[ctPath] = xmlBytes(ctDoc);
+    }
+
     return this;
   }
 

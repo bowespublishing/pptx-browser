@@ -42,6 +42,7 @@ import { loadEmbeddedFonts, listEmbeddedFonts } from './fntdata.js';
 import { extractSlide, extractAll, extractText, searchSlides } from './extract.js';
 import { SlideShow } from './slideshow.js';
 import { copySlideToClipboard, downloadSlide, downloadAllSlides, createLazyDeck } from './clipboard.js';
+import { OdpWriter } from './odp.js';
 
 export default class PptxRenderer {
   constructor() {
@@ -615,6 +616,32 @@ export default class PptxRenderer {
     return exportSlideToPdf(slideIndex, this, opts);
   }
 
+  // ── ODP export ──────────────────────────────────────────────────────────────
+
+  /**
+   * Convert the loaded PPTX to ODP (OpenDocument Presentation) bytes.
+   * Extracts text content, images, and backgrounds.
+   *
+   * @returns {Promise<Uint8Array>}
+   *
+   * @example
+   * const bytes = await renderer.toOdp();
+   * const blob = new Blob([bytes], { type: 'application/vnd.oasis.opendocument.presentation' });
+   */
+  async toOdp() {
+    const writer = OdpWriter.fromRenderer(this);
+    return writer.save();
+  }
+
+  /**
+   * Export and download as an ODP file.
+   * @param {string} [filename='presentation.odp']
+   */
+  async downloadOdp(filename = 'presentation.odp') {
+    const writer = OdpWriter.fromRenderer(this);
+    return writer.download(filename);
+  }
+
   /**
    * Get the speaker notes for a slide as plain text.
    * @param {number} slideIndex
@@ -754,3 +781,6 @@ export { PptxWriter } from './writer.js';
 
 // PDF export
 export { exportToPdf, downloadAsPdf, exportSlideToPdf } from './pdf.js';
+
+// ODP (OpenDocument Presentation) writer
+export { OdpWriter } from './odp.js';
