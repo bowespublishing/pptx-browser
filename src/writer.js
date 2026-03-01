@@ -60,7 +60,10 @@
  *   .setShapeImage(slideIdx, name, bytes, mime)  — swap shape image
  *   .addImage(slideIdx, bytes, mime, rect)       — add new image shape
  *   .setSlideBackground(slideIdx, color)         — solid background color
+ *   .setDefaultFont(family)               — default font for new shapes
+ *   .setDefaultFontSize(pt)              — default font size (pt) for new shapes
  *   .setThemeColor(key, hexRgb)           — change theme colour (no #)
+ *   .setThemeFont(kind, fontFamily)       — set theme heading/body font
  *   .addSlide(atIdx?)                     — add a blank slide
  *   .duplicateSlide(fromIdx, toIdx?)      — copy slide
  *   .removeSlide(slideIdx)                — delete slide
@@ -275,6 +278,21 @@ function addContentType(files, ext, partName) {
   files[ctPath] = xmlBytes(doc);
 }
 
+/**
+ * Resolve a fontSize value to OOXML hundredths-of-a-point.
+ * Accepts either:
+ *   - Plain pt (e.g. 24) → converted to 2400
+ *   - Already in hundredths (e.g. 2400) → used as-is
+ *
+ * Heuristic: values ≤ 400 are treated as pt, above as raw hundredths.
+ * (400pt = largest reasonable font; 400 hundredths = 4pt which is unusable)
+ */
+function resolveFontSize(val, defaultPt) {
+  if (val === undefined || val === null) return defaultPt * 100;
+  if (val <= 400) return Math.round(val * 100);
+  return val;
+}
+
 // ── PptxWriter ────────────────────────────────────────────────────────────────
 
 export class PptxWriter {
@@ -289,6 +307,37 @@ export class PptxWriter {
 
     // Build ordered slide path list
     this._slidePaths = this._buildSlidePaths();
+
+    /** Default font family for new shapes (overridable per-call). */
+    this._defaultFont = 'Calibri';
+    /** Default font size in pt for new shapes (overridable per-call). */
+    this._defaultFontSizePt = 18;
+  }
+
+  // ── Defaults ───────────────────────────────────────────────────────────────
+
+  /**
+   * Set the default font family for all subsequently added shapes.
+   * Individual calls can still override via `fontFamily`.
+   *
+   * @param {string} family  e.g. 'Arial', 'Georgia', 'Inter'
+   * @returns {PptxWriter}
+   */
+  setDefaultFont(family) {
+    this._defaultFont = family;
+    return this;
+  }
+
+  /**
+   * Set the default font size (in pt) for all subsequently added shapes.
+   * Individual calls can still override via `fontSize`.
+   *
+   * @param {number} pt  e.g. 24
+   * @returns {PptxWriter}
+   */
+  setDefaultFontSize(pt) {
+    this._defaultFontSizePt = pt;
+    return this;
   }
 
   // ── Factory ─────────────────────────────────────────────────────────────────
@@ -702,14 +751,16 @@ export class PptxWriter {
    * @param {number} style.w           EMU width
    * @param {number} style.h           EMU height
    * @param {string} [style.color]     hex colour, no #
-   * @param {number} [style.fontSize]  pt * 100  (e.g. 2400 = 24pt)
+   * @param {number} [style.fontSize]  font size in **pt** (e.g. 24).
+   *   Values ≤ 400 are treated as pt; larger values are treated as raw
+   *   hundredths-of-a-point for backwards compatibility.
    * @param {boolean}[style.bold]
    * @param {boolean}[style.italic]
    * @param {boolean}[style.underline]
    * @param {boolean}[style.strikethrough]
    * @param {string} [style.align]     l|ctr|r|just
    * @param {string} [style.vertAlign] t|ctr|b  (vertical alignment)
-   * @param {string} [style.fontFamily]
+   * @param {string} [style.fontFamily]  defaults to setDefaultFont() value
    * @param {string} [style.fill]      shape background, hex no #
    * @param {string} [style.outline]   border colour, hex no #
    * @param {number} [style.outlineWidth] border width EMU (default 12700 = 1pt)
@@ -719,11 +770,13 @@ export class PptxWriter {
   addTextBox(slideIdx, text, style = {}) {
     const {
       x = 914400, y = 914400, w = 4572000, h = 914400,
-      color = '000000', fontSize = 1800, bold = false,
+      color = '000000', bold = false,
       italic = false, underline = false, strikethrough = false,
-      align = 'l', vertAlign, fontFamily = 'Calibri',
+      align = 'l', vertAlign,
       fill, outline, outlineWidth = 12700, lineSpacing, rotation,
     } = style;
+    const fontSize = resolveFontSize(style.fontSize, this._defaultFontSizePt);
+    const fontFamily = style.fontFamily ?? this._defaultFont;
 
     const doc    = this._slideDoc(slideIdx);
     const spTree = getSpTree(doc);
@@ -787,6 +840,7 @@ export class PptxWriter {
    * @param {number} slideIdx
    * @param {Array<Array<{text, color?, fontSize?, bold?, italic?, underline?, strikethrough?, fontFamily?}>>} paragraphs
    *   Array of paragraphs, each paragraph is an array of run objects.
+   *   `fontSize` in each run is in **pt** (e.g. 24).
    * @param {object} style
    * @param {number} style.x        EMU from left
    * @param {number} style.y        EMU from top
@@ -803,11 +857,11 @@ export class PptxWriter {
    * @example
    *   writer.addRichText(0, [
    *     [
-   *       { text: 'Bold title', bold: true, fontSize: 3200, color: '1F4E79' },
+   *       { text: 'Bold title', bold: true, fontSize: 32, color: '1F4E79' },
    *     ],
    *     [
-   *       { text: 'Normal text ', fontSize: 1800 },
-   *       { text: 'with red highlight', fontSize: 1800, color: 'FF0000', italic: true },
+   *       { text: 'Normal text ', fontSize: 18 },
+   *       { text: 'with red highlight', fontSize: 18, color: 'FF0000', italic: true },
    *     ],
    *   ], { x: 914400, y: 914400, w: 7000000, h: 2000000 });
    */
@@ -840,9 +894,9 @@ export class PptxWriter {
     for (const para of paragraphs) {
       parasXml += `<a:p><a:pPr algn="${align}">${spcXml}</a:pPr>`;
       for (const run of para) {
-        const sz = run.fontSize ?? 1800;
+        const sz = resolveFontSize(run.fontSize, this._defaultFontSizePt);
         const clr = run.color ?? '000000';
-        const ff = run.fontFamily ?? 'Calibri';
+        const ff = run.fontFamily ?? this._defaultFont;
         parasXml += `<a:r><a:rPr lang="en-US" sz="${sz}" b="${run.bold ? 1 : 0}" i="${run.italic ? 1 : 0}"` +
           `${run.underline ? ' u="sng"' : ''}${run.strikethrough ? ' strike="sngStrike"' : ''} dirty="0">` +
           `<a:solidFill><a:srgbClr val="${clr}"/></a:solidFill>` +
@@ -895,10 +949,10 @@ export class PptxWriter {
    * @param {number} [style.outlineWidth=12700]
    * @param {string} [style.text]      optional text inside the shape
    * @param {string} [style.textColor='FFFFFF']
-   * @param {number} [style.fontSize=1800]   pt * 100
+   * @param {number} [style.fontSize=18]    pt (e.g. 24 for 24pt). Uses instance default if omitted.
    * @param {boolean}[style.bold]
    * @param {boolean}[style.italic]
-   * @param {string} [style.fontFamily='Calibri']
+   * @param {string} [style.fontFamily]   defaults to instance default (see setDefaultFont)
    * @param {string} [style.align='ctr']
    * @param {string} [style.vertAlign='ctr']  t|ctr|b
    * @param {number} [style.rotation]
@@ -907,10 +961,12 @@ export class PptxWriter {
     const {
       x = 914400, y = 914400, w = 2743200, h = 2743200,
       fill = '4472C4', outline, outlineWidth = 12700,
-      text, textColor = 'FFFFFF', fontSize = 1800,
-      bold = false, italic = false, fontFamily = 'Calibri',
+      text, textColor = 'FFFFFF',
+      bold = false, italic = false,
       align = 'ctr', vertAlign = 'ctr', rotation,
     } = style;
+    const fontSize = resolveFontSize(style.fontSize, this._defaultFontSizePt);
+    const fontFamily = style.fontFamily ?? this._defaultFont;
 
     const doc    = this._slideDoc(slideIdx);
     const spTree = getSpTree(doc);
@@ -973,10 +1029,10 @@ export class PptxWriter {
    * @param {number}   style.w         EMU width
    * @param {number}   style.h         EMU height
    * @param {string}   [style.color='000000']
-   * @param {number}   [style.fontSize=1800]   pt * 100
+   * @param {number}   [style.fontSize=18]    pt (e.g. 24). Uses instance default if omitted.
    * @param {boolean}  [style.bold]
    * @param {boolean}  [style.italic]
-   * @param {string}   [style.fontFamily='Calibri']
+   * @param {string}   [style.fontFamily]     defaults to instance default (see setDefaultFont)
    * @param {string}   [style.bulletChar='•']  set to '' for no bullet, or '1' for numbered
    * @param {string}   [style.bulletColor]     hex, defaults to text color
    * @param {string}   [style.fill]            background fill hex
@@ -985,10 +1041,12 @@ export class PptxWriter {
   addList(slideIdx, items, style = {}) {
     const {
       x = 914400, y = 914400, w = 7000000, h = 3000000,
-      color = '000000', fontSize = 1800, bold = false, italic = false,
-      fontFamily = 'Calibri', bulletChar = '\u2022',
+      color = '000000', bold = false, italic = false,
+      bulletChar = '\u2022',
       bulletColor, fill, align = 'l',
     } = style;
+    const fontSize = resolveFontSize(style.fontSize, this._defaultFontSizePt);
+    const fontFamily = style.fontFamily ?? this._defaultFont;
 
     const doc    = this._slideDoc(slideIdx);
     const spTree = getSpTree(doc);
@@ -1251,6 +1309,53 @@ export class PptxWriter {
         }
         break;
       }
+    }
+
+    this._files[themePath] = xmlBytes(doc);
+    return this;
+  }
+
+  /**
+   * Set a theme font (major = headings, minor = body text).
+   * These are the fonts that shapes using theme fonts (+mj-lt, +mn-lt) will
+   * resolve to. You can also pass any custom font name — PowerPoint will use
+   * the font if available on the system, or substitute a fallback.
+   *
+   * @param {'major'|'minor'} kind  'major' (headings) or 'minor' (body)
+   * @param {string} fontFamily     e.g. 'Montserrat', 'Georgia', 'Comic Sans MS'
+   * @returns {PptxWriter}
+   *
+   * @example
+   *   writer.setThemeFont('major', 'Montserrat');  // headings
+   *   writer.setThemeFont('minor', 'Open Sans');    // body text
+   */
+  setThemeFont(kind, fontFamily) {
+    const presRels = this._presRels;
+    let themePath = Object.values(presRels).find(r => r.type?.includes('theme'))?.fullPath;
+
+    if (!themePath) {
+      const masterRel = Object.values(presRels).find(r => r.type?.includes('slideMaster'));
+      if (masterRel) {
+        const mr = parseRels(this._files, masterRel.fullPath);
+        themePath = Object.values(mr).find(r => r.type?.includes('theme'))?.fullPath;
+      }
+    }
+    if (!themePath) return this;
+
+    const doc = readXml(this._files, themePath);
+    if (!doc) return this;
+
+    // Find the fontScheme > majorFont/minorFont > latin element
+    const fontScheme = g1(doc, 'fontScheme');
+    if (!fontScheme) return this;
+
+    const target = kind === 'major' ? 'majorFont' : 'minorFont';
+    const fontEl = g1(fontScheme, target);
+    if (!fontEl) return this;
+
+    const latin = g1(fontEl, 'latin');
+    if (latin) {
+      latin.setAttribute('typeface', fontFamily);
     }
 
     this._files[themePath] = xmlBytes(doc);

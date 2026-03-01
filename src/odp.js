@@ -28,6 +28,8 @@
  *   OdpWriter.create(opts)              — new blank ODP
  *   OdpWriter.fromRenderer(renderer)    — convert loaded PPTX to ODP
  *
+ *   .setDefaultFont(family)             — set default font for new shapes
+ *   .setDefaultFontSize(pt)            — set default font size (pt)
  *   .addSlide()                         — add a blank slide
  *   .removeSlide(idx)                   — remove a slide
  *   .addTextBox(slideIdx, text, style)  — text box (italic/underline/fill/…)
@@ -121,6 +123,30 @@ export class OdpWriter {
     this._width  = 25.4;   // 10 inches
     this._height = 14.288;  // ~5.63 inches (16:9)
     this._title = 'Presentation';
+    /** Default font family for all new shapes */
+    this._defaultFont = 'Calibri';
+    /** Default font size in pt */
+    this._defaultFontSizePt = 18;
+  }
+
+  /**
+   * Set the default font family for all subsequent shapes.
+   * @param {string} family  e.g. 'Arial', 'Helvetica', 'Times New Roman'
+   * @returns {OdpWriter}
+   */
+  setDefaultFont(family) {
+    this._defaultFont = family;
+    return this;
+  }
+
+  /**
+   * Set the default font size (pt) for all subsequent shapes.
+   * @param {number} pt  e.g. 24
+   * @returns {OdpWriter}
+   */
+  setDefaultFontSize(pt) {
+    this._defaultFontSizePt = pt;
+    return this;
   }
 
   // ── Factory ───────────────────────────────────────────────────────────────
@@ -254,12 +280,14 @@ export class OdpWriter {
   addTextBox(slideIdx, text, style = {}) {
     const {
       x = 2, y = 2, w = 20, h = 3,
-      color = '000000', fontSize = 18,
+      color = '000000',
       bold = false, italic = false, underline = false,
       strikethrough = false, align = 'start',
-      fontFamily = 'Calibri', fill, outline,
+      fill, outline,
       outlineWidth = 0.035, lineSpacing, rotation,
     } = style;
+    const fontSize = style.fontSize ?? this._defaultFontSizePt;
+    const fontFamily = style.fontFamily ?? this._defaultFont;
 
     const slide = this._slides[slideIdx];
     if (!slide) throw new RangeError(`Slide ${slideIdx} out of range`);
@@ -374,9 +402,9 @@ export class OdpWriter {
     for (const para of paragraphs) {
       parasXml += `<text:p text:style-name="${paraStyleName}">`;
       for (const run of para) {
-        const sz = run.fontSize ?? 18;
+        const sz = run.fontSize ?? this._defaultFontSizePt;
         const clr = run.color ?? '000000';
-        const ff = run.fontFamily ?? 'Calibri';
+        const ff = run.fontFamily ?? this._defaultFont;
         const tsName = this._addStyle(
           'text',
           `<style:text-properties fo:font-size="${sz}pt" fo:color="#${clr}"` +
@@ -440,10 +468,12 @@ export class OdpWriter {
     const {
       x = 2, y = 2, w = 8, h = 8,
       fill = '4472C4', outline, outlineWidth = 0.035,
-      text, textColor = 'FFFFFF', fontSize = 18,
-      bold = false, italic = false, fontFamily = 'Calibri',
+      text, textColor = 'FFFFFF',
+      bold = false, italic = false,
       align = 'center', rotation,
     } = style;
+    const fontSize = style.fontSize ?? this._defaultFontSizePt;
+    const fontFamily = style.fontFamily ?? this._defaultFont;
 
     const slide = this._slides[slideIdx];
     if (!slide) throw new RangeError(`Slide ${slideIdx} out of range`);
@@ -540,10 +570,12 @@ export class OdpWriter {
   addList(slideIdx, items, style = {}) {
     const {
       x = 2, y = 2, w = 20, h = 10,
-      color = '000000', fontSize = 18, bold = false, italic = false,
-      fontFamily = 'Calibri', bulletChar = '\u2022',
+      color = '000000', bold = false, italic = false,
+      bulletChar = '\u2022',
       fill, align = 'start',
     } = style;
+    const fontSize = style.fontSize ?? this._defaultFontSizePt;
+    const fontFamily = style.fontFamily ?? this._defaultFont;
 
     const slide = this._slides[slideIdx];
     if (!slide) throw new RangeError(`Slide ${slideIdx} out of range`);
