@@ -45,6 +45,7 @@
  *
  * ── API reference ─────────────────────────────────────────────────────────────
  *
+ *   PptxWriter.create(opts)               — create from scratch (blank slide)
  *   PptxWriter.fromRenderer(renderer)     — clone from loaded PptxRenderer
  *   PptxWriter.fromBytes(buffer)          — parse PPTX bytes fresh
  *
@@ -52,11 +53,18 @@
  *   .replaceText(find, replace, opts)     — global find-and-replace
  *   .setShapeText(slideIdx, name, text)   — set text of named shape
  *   .getShapeText(slideIdx, name)         — read text from named shape
- *   .addTextBox(slideIdx, text, style)    — add a new text box
+ *   .addTextBox(slideIdx, text, style)    — add text box (italic/underline/fill/…)
+ *   .addRichText(slideIdx, paragraphs, style)  — mixed-format text runs
+ *   .addShape(slideIdx, type, style)      — preset shape with optional text
+ *   .addList(slideIdx, items, style)      — bullet/numbered list
  *   .setShapeImage(slideIdx, name, bytes, mime)  — swap shape image
  *   .addImage(slideIdx, bytes, mime, rect)       — add new image shape
  *   .setSlideBackground(slideIdx, color)         — solid background color
+ *   .setDefaultFont(family)               — default font for new shapes
+ *   .setDefaultFontSize(pt)              — default font size (pt) for new shapes
  *   .setThemeColor(key, hexRgb)           — change theme colour (no #)
+ *   .setThemeFont(kind, fontFamily)       — set theme heading/body font
+ *   .addSlide(atIdx?)                     — add a blank slide
  *   .duplicateSlide(fromIdx, toIdx?)      — copy slide
  *   .removeSlide(slideIdx)                — delete slide
  *   .reorderSlides(newOrder)              — reorder by index array
@@ -171,6 +179,33 @@ function nextRId(rels) {
   return 'rId' + ((nums.length ? Math.max(...nums) : 0) + 1);
 }
 
+// ── Font embedding helpers ────────────────────────────────────────────────────
+
+/** Generate a random GUID string: {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}. */
+function _generateGuid() {
+  const hex = () => Math.floor(Math.random() * 0x10000).toString(16).padStart(4, '0');
+  return `{${hex()}${hex()}-${hex()}-${hex()}-${hex()}-${hex()}${hex()}${hex()}}`;
+}
+
+/** Derive the 32-byte XOR key from a GUID (ECMA-376 §15.2.12). */
+function _guidToKey(guid) {
+  const h = guid.replace(/[{}\-]/g, '');
+  const d1 = h.slice(0, 8), d2 = h.slice(8, 12), d3 = h.slice(12, 16), d4 = h.slice(16, 32);
+  const key = new Uint8Array(16);
+  // Data1 little-endian
+  key[0] = parseInt(d1.slice(6, 8), 16);  key[1] = parseInt(d1.slice(4, 6), 16);
+  key[2] = parseInt(d1.slice(2, 4), 16);  key[3] = parseInt(d1.slice(0, 2), 16);
+  // Data2 little-endian
+  key[4] = parseInt(d2.slice(2, 4), 16);  key[5] = parseInt(d2.slice(0, 2), 16);
+  // Data3 little-endian
+  key[6] = parseInt(d3.slice(2, 4), 16);  key[7] = parseInt(d3.slice(0, 2), 16);
+  // Data4 big-endian
+  for (let i = 0; i < 8; i++) key[8 + i] = parseInt(d4.slice(i * 2, i * 2 + 2), 16);
+  const key32 = new Uint8Array(32);
+  key32.set(key); key32.set(key, 16);
+  return key32;
+}
+
 // ── Shape lookup helpers ──────────────────────────────────────────────────────
 
 function findShapeByName(spTree, name) {
@@ -237,6 +272,11 @@ function replaceInDoc(doc, find, replace, caseSensitive = true) {
 
 function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
+/** Escape text for use in XML element content / attribute values. */
+function escXml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 // ── Content type helpers ──────────────────────────────────────────────────────
 
 const MIME_EXT = {
@@ -265,6 +305,21 @@ function addContentType(files, ext, partName) {
   files[ctPath] = xmlBytes(doc);
 }
 
+/**
+ * Resolve a fontSize value to OOXML hundredths-of-a-point.
+ * Accepts either:
+ *   - Plain pt (e.g. 24) → converted to 2400
+ *   - Already in hundredths (e.g. 2400) → used as-is
+ *
+ * Heuristic: values ≤ 400 are treated as pt, above as raw hundredths.
+ * (400pt = largest reasonable font; 400 hundredths = 4pt which is unusable)
+ */
+function resolveFontSize(val, defaultPt) {
+  if (val === undefined || val === null) return defaultPt * 100;
+  if (val <= 400) return Math.round(val * 100);
+  return val;
+}
+
 // ── PptxWriter ────────────────────────────────────────────────────────────────
 
 export class PptxWriter {
@@ -279,6 +334,37 @@ export class PptxWriter {
 
     // Build ordered slide path list
     this._slidePaths = this._buildSlidePaths();
+
+    /** Default font family for new shapes (overridable per-call). */
+    this._defaultFont = 'Calibri';
+    /** Default font size in pt for new shapes (overridable per-call). */
+    this._defaultFontSizePt = 18;
+  }
+
+  // ── Defaults ───────────────────────────────────────────────────────────────
+
+  /**
+   * Set the default font family for all subsequently added shapes.
+   * Individual calls can still override via `fontFamily`.
+   *
+   * @param {string} family  e.g. 'Arial', 'Georgia', 'Inter'
+   * @returns {PptxWriter}
+   */
+  setDefaultFont(family) {
+    this._defaultFont = family;
+    return this;
+  }
+
+  /**
+   * Set the default font size (in pt) for all subsequently added shapes.
+   * Individual calls can still override via `fontSize`.
+   *
+   * @param {number} pt  e.g. 24
+   * @returns {PptxWriter}
+   */
+  setDefaultFontSize(pt) {
+    this._defaultFontSizePt = pt;
+    return this;
   }
 
   // ── Factory ─────────────────────────────────────────────────────────────────
@@ -296,6 +382,198 @@ export class PptxWriter {
   /** Parse from raw ArrayBuffer or Uint8Array. */
   static async fromBytes(buffer) {
     const files = await readZip(buffer);
+    return new PptxWriter(files);
+  }
+
+  /**
+   * Create a new PPTX from scratch with a blank slide.
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.width=9144000]   slide width in EMU  (default 10in = widescreen)
+   * @param {number} [opts.height=5143500]  slide height in EMU (default ~5.63in = 16:9)
+   * @param {string} [opts.title='Presentation']
+   * @returns {PptxWriter}
+   *
+   * @example
+   *   const writer = PptxWriter.create();
+   *   writer.addTextBox(0, 'Hello World', { x: 914400, y: 914400, w: 7000000, h: 900000, fontSize: 4400 });
+   *   await writer.download('new.pptx');
+   *
+   * @example
+   *   // 4:3 aspect ratio
+   *   const writer = PptxWriter.create({ width: 9144000, height: 6858000 });
+   */
+  static create(opts = {}) {
+    const {
+      width  = 9144000,
+      height = 5143500,
+      title  = 'Presentation',
+    } = opts;
+
+    const files = {};
+
+    // ── [Content_Types].xml ──────────────────────────────────────────────
+    files['[Content_Types].xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+  <Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>
+  <Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>
+  <Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+</Types>`);
+
+    // ── _rels/.rels ──────────────────────────────────────────────────────
+    files['_rels/.rels'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+</Relationships>`);
+
+    // ── docProps/core.xml ────────────────────────────────────────────────
+    const now = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+    files['docProps/core.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+  xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:title>${escXml(title)}</dc:title>
+  <dcterms:created xsi:type="dcterms:W3CDTF">${now}</dcterms:created>
+  <dcterms:modified xsi:type="dcterms:W3CDTF">${now}</dcterms:modified>
+</cp:coreProperties>`);
+
+    // ── docProps/app.xml ─────────────────────────────────────────────────
+    files['docProps/app.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+  <Application>pptx-browser</Application>
+  <Slides>1</Slides>
+</Properties>`);
+
+    // ── ppt/presentation.xml ─────────────────────────────────────────────
+    files['ppt/presentation.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>
+  <p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst>
+  <p:sldSz cx="${width}" cy="${height}"/>
+  <p:notesSz cx="${height}" cy="${width}"/>
+</p:presentation>`);
+
+    files['ppt/_rels/presentation.xml.rels'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>
+</Relationships>`);
+
+    // ── ppt/theme/theme1.xml ─────────────────────────────────────────────
+    files['ppt/theme/theme1.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme">
+  <a:themeElements>
+    <a:clrScheme name="Office">
+      <a:dk1><a:srgbClr val="000000"/></a:dk1>
+      <a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>
+      <a:dk2><a:srgbClr val="44546A"/></a:dk2>
+      <a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>
+      <a:accent1><a:srgbClr val="4472C4"/></a:accent1>
+      <a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
+      <a:accent3><a:srgbClr val="A5A5A5"/></a:accent3>
+      <a:accent4><a:srgbClr val="FFC000"/></a:accent4>
+      <a:accent5><a:srgbClr val="5B9BD5"/></a:accent5>
+      <a:accent6><a:srgbClr val="70AD47"/></a:accent6>
+      <a:hlink><a:srgbClr val="0563C1"/></a:hlink>
+      <a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+    </a:clrScheme>
+    <a:fontScheme name="Office">
+      <a:majorFont><a:latin typeface="Calibri Light"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont>
+      <a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont>
+    </a:fontScheme>
+    <a:fmtScheme name="Office">
+      <a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst>
+      <a:lnStyleLst><a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst>
+      <a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>
+      <a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst>
+    </a:fmtScheme>
+  </a:themeElements>
+</a:theme>`);
+
+    // ── ppt/slideMasters/slideMaster1.xml ────────────────────────────────
+    files['ppt/slideMasters/slideMaster1.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:cSld>
+    <p:bg><p:bgRef idx="1001"><a:schemeClr val="bg1"/></p:bgRef></p:bg>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+    </p:spTree>
+  </p:cSld>
+  <p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>
+  <p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst>
+</p:sldMaster>`);
+
+    files['ppt/slideMasters/_rels/slideMaster1.xml.rels'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/>
+</Relationships>`);
+
+    // ── ppt/slideLayouts/slideLayout1.xml ─────────────────────────────────
+    files['ppt/slideLayouts/slideLayout1.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldLayout xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+  type="blank" preserve="1">
+  <p:cSld name="Blank">
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+    </p:spTree>
+  </p:cSld>
+  <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>
+</p:sldLayout>`);
+
+    files['ppt/slideLayouts/_rels/slideLayout1.xml.rels'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>
+</Relationships>`);
+
+    // ── ppt/slides/slide1.xml ────────────────────────────────────────────
+    files['ppt/slides/slide1.xml'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+    </p:spTree>
+  </p:cSld>
+</p:sld>`);
+
+    files['ppt/slides/_rels/slide1.xml.rels'] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+</Relationships>`);
+
     return new PptxWriter(files);
   }
 
@@ -493,35 +771,70 @@ export class PptxWriter {
    * Add a new text box to a slide.
    *
    * @param {number} slideIdx
-   * @param {string} text
+   * @param {string} text          use \n for line breaks
    * @param {object} style
-   * @param {number} style.x      EMU from left edge
-   * @param {number} style.y      EMU from top edge
-   * @param {number} style.w      EMU width
-   * @param {number} style.h      EMU height
-   * @param {string} [style.color]      hex colour, no #
-   * @param {number} [style.fontSize]   pt * 100  (e.g. 2400 = 24pt)
+   * @param {number} style.x           EMU from left edge
+   * @param {number} style.y           EMU from top edge
+   * @param {number} style.w           EMU width
+   * @param {number} style.h           EMU height
+   * @param {string} [style.color]     hex colour, no #
+   * @param {number} [style.fontSize]  font size in **pt** (e.g. 24).
+   *   Values ≤ 400 are treated as pt; larger values are treated as raw
+   *   hundredths-of-a-point for backwards compatibility.
    * @param {boolean}[style.bold]
-   * @param {string} [style.align]      l|ctr|r
-   * @param {string} [style.fontFamily]
+   * @param {boolean}[style.italic]
+   * @param {boolean}[style.underline]
+   * @param {boolean}[style.strikethrough]
+   * @param {string} [style.align]     l|ctr|r|just
+   * @param {string} [style.vertAlign] t|ctr|b  (vertical alignment)
+   * @param {string} [style.fontFamily]  defaults to setDefaultFont() value
+   * @param {string} [style.fill]      shape background, hex no #
+   * @param {string} [style.outline]   border colour, hex no #
+   * @param {number} [style.outlineWidth] border width EMU (default 12700 = 1pt)
+   * @param {number} [style.lineSpacing]  line spacing in hundredths of a percent (e.g. 150000 = 150%)
+   * @param {number} [style.rotation]     rotation in 60000ths of a degree (e.g. 5400000 = 90°)
    */
   addTextBox(slideIdx, text, style = {}) {
     const {
       x = 914400, y = 914400, w = 4572000, h = 914400,
-      color = '000000', fontSize = 1800, bold = false,
-      align = 'l', fontFamily = 'Calibri',
+      color = '000000', bold = false,
+      italic = false, underline = false, strikethrough = false,
+      align = 'l', vertAlign,
+      fill, outline, outlineWidth = 12700, lineSpacing, rotation,
     } = style;
+    const fontSize = resolveFontSize(style.fontSize, this._defaultFontSizePt);
+    const fontFamily = style.fontFamily ?? this._defaultFont;
 
     const doc    = this._slideDoc(slideIdx);
     const spTree = getSpTree(doc);
     if (!spTree) return this;
 
-    // Next shape ID
     const maxId = Math.max(0, ...gtn(spTree, 'cNvPr').map(e => parseInt(e.getAttribute('id') || '0', 10)));
     const newId = maxId + 1;
     const name  = `TextBox ${newId}`;
-
     const nsA = NS.a, nsP = NS.p;
+
+    const fillXml = fill
+      ? `<a:solidFill><a:srgbClr val="${fill}"/></a:solidFill>`
+      : `<a:noFill/>`;
+    const lnXml = outline
+      ? `<a:ln w="${outlineWidth}"><a:solidFill><a:srgbClr val="${outline}"/></a:solidFill></a:ln>`
+      : '';
+    const rotAttr = rotation ? ` rot="${rotation}"` : '';
+    const anchorAttr = vertAlign ? ` anchor="${vertAlign}"` : '';
+    const spcAttr = lineSpacing
+      ? `<a:lnSpc><a:spcPct val="${lineSpacing}"/></a:lnSpc>`
+      : '';
+
+    const lines = text.split('\n');
+    const parasXml = lines.map(line =>
+      `<a:p><a:pPr algn="${align}">${spcAttr}</a:pPr>` +
+      `<a:r><a:rPr lang="en-US" sz="${fontSize}" b="${bold ? 1 : 0}" i="${italic ? 1 : 0}"` +
+      `${underline ? ' u="sng"' : ''}${strikethrough ? ' strike="sngStrike"' : ''} dirty="0">` +
+      `<a:solidFill><a:srgbClr val="${color}"/></a:solidFill>` +
+      `<a:latin typeface="${escXml(fontFamily)}"/>` +
+      `</a:rPr><a:t>${escXml(line)}</a:t></a:r></a:p>`
+    ).join('');
 
     const xml = `<p:sp xmlns:p="${nsP}" xmlns:a="${nsA}">
   <p:nvSpPr>
@@ -530,23 +843,288 @@ export class PptxWriter {
     <p:nvPr/>
   </p:nvSpPr>
   <p:spPr>
+    <a:xfrm${rotAttr}><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+    ${fillXml}${lnXml}
+  </p:spPr>
+  <p:txBody>
+    <a:bodyPr wrap="square" rtlCol="0"${anchorAttr}><a:spAutoFit/></a:bodyPr>
+    <a:lstStyle/>
+    ${parasXml}
+  </p:txBody>
+</p:sp>`;
+
+    const frag = parseXml(xml);
+    spTree.appendChild(doc.adoptNode(frag.documentElement));
+    this._saveSlideDoc(slideIdx, doc);
+    return this;
+  }
+
+  /**
+   * Add a text box with mixed formatting (rich text).
+   * Each run can have its own font, size, colour, bold, italic, etc.
+   *
+   * @param {number} slideIdx
+   * @param {Array<Array<{text, color?, fontSize?, bold?, italic?, underline?, strikethrough?, fontFamily?}>>} paragraphs
+   *   Array of paragraphs, each paragraph is an array of run objects.
+   *   `fontSize` in each run is in **pt** (e.g. 24).
+   * @param {object} style
+   * @param {number} style.x        EMU from left
+   * @param {number} style.y        EMU from top
+   * @param {number} style.w        EMU width
+   * @param {number} style.h        EMU height
+   * @param {string} [style.align]  l|ctr|r|just
+   * @param {string} [style.vertAlign] t|ctr|b
+   * @param {string} [style.fill]   shape fill hex
+   * @param {string} [style.outline] border hex
+   * @param {number} [style.outlineWidth]
+   * @param {number} [style.lineSpacing]
+   * @param {number} [style.rotation]
+   *
+   * @example
+   *   writer.addRichText(0, [
+   *     [
+   *       { text: 'Bold title', bold: true, fontSize: 32, color: '1F4E79' },
+   *     ],
+   *     [
+   *       { text: 'Normal text ', fontSize: 18 },
+   *       { text: 'with red highlight', fontSize: 18, color: 'FF0000', italic: true },
+   *     ],
+   *   ], { x: 914400, y: 914400, w: 7000000, h: 2000000 });
+   */
+  addRichText(slideIdx, paragraphs, style = {}) {
+    const {
+      x = 914400, y = 914400, w = 4572000, h = 914400,
+      align = 'l', vertAlign, fill, outline, outlineWidth = 12700,
+      lineSpacing, rotation,
+    } = style;
+
+    const doc    = this._slideDoc(slideIdx);
+    const spTree = getSpTree(doc);
+    if (!spTree) return this;
+
+    const maxId = Math.max(0, ...gtn(spTree, 'cNvPr').map(e => parseInt(e.getAttribute('id') || '0', 10)));
+    const newId = maxId + 1;
+    const nsA = NS.a, nsP = NS.p;
+
+    const fillXml = fill
+      ? `<a:solidFill><a:srgbClr val="${fill}"/></a:solidFill>`
+      : `<a:noFill/>`;
+    const lnXml = outline
+      ? `<a:ln w="${outlineWidth}"><a:solidFill><a:srgbClr val="${outline}"/></a:solidFill></a:ln>`
+      : '';
+    const rotAttr = rotation ? ` rot="${rotation}"` : '';
+    const anchorAttr = vertAlign ? ` anchor="${vertAlign}"` : '';
+    const spcXml = lineSpacing ? `<a:lnSpc><a:spcPct val="${lineSpacing}"/></a:lnSpc>` : '';
+
+    let parasXml = '';
+    for (const para of paragraphs) {
+      parasXml += `<a:p><a:pPr algn="${align}">${spcXml}</a:pPr>`;
+      for (const run of para) {
+        const sz = resolveFontSize(run.fontSize, this._defaultFontSizePt);
+        const clr = run.color ?? '000000';
+        const ff = run.fontFamily ?? this._defaultFont;
+        parasXml += `<a:r><a:rPr lang="en-US" sz="${sz}" b="${run.bold ? 1 : 0}" i="${run.italic ? 1 : 0}"` +
+          `${run.underline ? ' u="sng"' : ''}${run.strikethrough ? ' strike="sngStrike"' : ''} dirty="0">` +
+          `<a:solidFill><a:srgbClr val="${clr}"/></a:solidFill>` +
+          `<a:latin typeface="${escXml(ff)}"/>` +
+          `</a:rPr><a:t>${escXml(run.text)}</a:t></a:r>`;
+      }
+      parasXml += `</a:p>`;
+    }
+
+    const xml = `<p:sp xmlns:p="${nsP}" xmlns:a="${nsA}">
+  <p:nvSpPr>
+    <p:cNvPr id="${newId}" name="TextBox ${newId}"/>
+    <p:cNvSpPr txBox="1"><a:spLocks noGrp="1"/></p:cNvSpPr>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
+    <a:xfrm${rotAttr}><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+    ${fillXml}${lnXml}
+  </p:spPr>
+  <p:txBody>
+    <a:bodyPr wrap="square" rtlCol="0"${anchorAttr}><a:spAutoFit/></a:bodyPr>
+    <a:lstStyle/>
+    ${parasXml}
+  </p:txBody>
+</p:sp>`;
+
+    const frag = parseXml(xml);
+    spTree.appendChild(doc.adoptNode(frag.documentElement));
+    this._saveSlideDoc(slideIdx, doc);
+    return this;
+  }
+
+  /**
+   * Add a preset shape (rectangle, ellipse, arrow, etc.) to a slide.
+   *
+   * @param {number} slideIdx
+   * @param {string} shapeType   preset geometry name:
+   *   rect, roundRect, ellipse, triangle, diamond, pentagon, hexagon,
+   *   star5, star6, rightArrow, leftArrow, upArrow, downArrow,
+   *   heart, cloud, line, plus, can, cube, donut, …
+   *   (any PowerPoint preset geometry name)
+   * @param {object} style
+   * @param {number} style.x           EMU from left
+   * @param {number} style.y           EMU from top
+   * @param {number} style.w           EMU width
+   * @param {number} style.h           EMU height
+   * @param {string} [style.fill='4472C4']   fill colour hex, no #
+   * @param {string} [style.outline]         border colour hex
+   * @param {number} [style.outlineWidth=12700]
+   * @param {string} [style.text]      optional text inside the shape
+   * @param {string} [style.textColor='FFFFFF']
+   * @param {number} [style.fontSize=18]    pt (e.g. 24 for 24pt). Uses instance default if omitted.
+   * @param {boolean}[style.bold]
+   * @param {boolean}[style.italic]
+   * @param {string} [style.fontFamily]   defaults to instance default (see setDefaultFont)
+   * @param {string} [style.align='ctr']
+   * @param {string} [style.vertAlign='ctr']  t|ctr|b
+   * @param {number} [style.rotation]
+   */
+  addShape(slideIdx, shapeType, style = {}) {
+    const {
+      x = 914400, y = 914400, w = 2743200, h = 2743200,
+      fill = '4472C4', outline, outlineWidth = 12700,
+      text, textColor = 'FFFFFF',
+      bold = false, italic = false,
+      align = 'ctr', vertAlign = 'ctr', rotation,
+    } = style;
+    const fontSize = resolveFontSize(style.fontSize, this._defaultFontSizePt);
+    const fontFamily = style.fontFamily ?? this._defaultFont;
+
+    const doc    = this._slideDoc(slideIdx);
+    const spTree = getSpTree(doc);
+    if (!spTree) return this;
+
+    const maxId = Math.max(0, ...gtn(spTree, 'cNvPr').map(e => parseInt(e.getAttribute('id') || '0', 10)));
+    const newId = maxId + 1;
+    const nsA = NS.a, nsP = NS.p;
+
+    const fillXml = fill
+      ? `<a:solidFill><a:srgbClr val="${fill}"/></a:solidFill>`
+      : `<a:noFill/>`;
+    const lnXml = outline
+      ? `<a:ln w="${outlineWidth}"><a:solidFill><a:srgbClr val="${outline}"/></a:solidFill></a:ln>`
+      : '';
+    const rotAttr = rotation ? ` rot="${rotation}"` : '';
+
+    let txBodyXml = '';
+    if (text !== undefined && text !== null) {
+      txBodyXml = `<p:txBody>
+    <a:bodyPr wrap="square" rtlCol="0" anchor="${vertAlign}"/>
+    <a:lstStyle/>
+    <a:p><a:pPr algn="${align}"/>
+      <a:r><a:rPr lang="en-US" sz="${fontSize}" b="${bold ? 1 : 0}" i="${italic ? 1 : 0}" dirty="0">
+        <a:solidFill><a:srgbClr val="${textColor}"/></a:solidFill>
+        <a:latin typeface="${escXml(fontFamily)}"/>
+      </a:rPr><a:t>${escXml(text)}</a:t></a:r>
+    </a:p>
+  </p:txBody>`;
+    }
+
+    const xml = `<p:sp xmlns:p="${nsP}" xmlns:a="${nsA}">
+  <p:nvSpPr>
+    <p:cNvPr id="${newId}" name="${shapeType} ${newId}"/>
+    <p:cNvSpPr/>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
+    <a:xfrm${rotAttr}><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm>
+    <a:prstGeom prst="${escXml(shapeType)}"><a:avLst/></a:prstGeom>
+    ${fillXml}${lnXml}
+  </p:spPr>
+  ${txBodyXml}
+</p:sp>`;
+
+    const frag = parseXml(xml);
+    spTree.appendChild(doc.adoptNode(frag.documentElement));
+    this._saveSlideDoc(slideIdx, doc);
+    return this;
+  }
+
+  /**
+   * Add a bulleted or numbered list to a slide.
+   *
+   * @param {number} slideIdx
+   * @param {string[]} items     list items (strings)
+   * @param {object}   style
+   * @param {number}   style.x         EMU from left
+   * @param {number}   style.y         EMU from top
+   * @param {number}   style.w         EMU width
+   * @param {number}   style.h         EMU height
+   * @param {string}   [style.color='000000']
+   * @param {number}   [style.fontSize=18]    pt (e.g. 24). Uses instance default if omitted.
+   * @param {boolean}  [style.bold]
+   * @param {boolean}  [style.italic]
+   * @param {string}   [style.fontFamily]     defaults to instance default (see setDefaultFont)
+   * @param {string}   [style.bulletChar='•']  set to '' for no bullet, or '1' for numbered
+   * @param {string}   [style.bulletColor]     hex, defaults to text color
+   * @param {string}   [style.fill]            background fill hex
+   * @param {string}   [style.align='l']
+   */
+  addList(slideIdx, items, style = {}) {
+    const {
+      x = 914400, y = 914400, w = 7000000, h = 3000000,
+      color = '000000', bold = false, italic = false,
+      bulletChar = '\u2022',
+      bulletColor, fill, align = 'l',
+    } = style;
+    const fontSize = resolveFontSize(style.fontSize, this._defaultFontSizePt);
+    const fontFamily = style.fontFamily ?? this._defaultFont;
+
+    const doc    = this._slideDoc(slideIdx);
+    const spTree = getSpTree(doc);
+    if (!spTree) return this;
+
+    const maxId = Math.max(0, ...gtn(spTree, 'cNvPr').map(e => parseInt(e.getAttribute('id') || '0', 10)));
+    const newId = maxId + 1;
+    const nsA = NS.a, nsP = NS.p;
+    const bClr = bulletColor || color;
+
+    const fillXml = fill
+      ? `<a:solidFill><a:srgbClr val="${fill}"/></a:solidFill>`
+      : `<a:noFill/>`;
+
+    const isNumbered = bulletChar === '1';
+
+    let parasXml = '';
+    for (let i = 0; i < items.length; i++) {
+      let bulletXml;
+      if (isNumbered) {
+        bulletXml = `<a:buFont typeface="+mj-lt"/><a:buAutoNum type="arabicPeriod"/>`;
+      } else if (bulletChar) {
+        bulletXml = `<a:buClr><a:srgbClr val="${bClr}"/></a:buClr>` +
+          `<a:buSzPct val="100000"/>` +
+          `<a:buChar char="${escXml(bulletChar)}"/>`;
+      } else {
+        bulletXml = '<a:buNone/>';
+      }
+
+      parasXml += `<a:p><a:pPr algn="${align}" marL="342900" indent="-342900">${bulletXml}</a:pPr>` +
+        `<a:r><a:rPr lang="en-US" sz="${fontSize}" b="${bold ? 1 : 0}" i="${italic ? 1 : 0}" dirty="0">` +
+        `<a:solidFill><a:srgbClr val="${color}"/></a:solidFill>` +
+        `<a:latin typeface="${escXml(fontFamily)}"/>` +
+        `</a:rPr><a:t>${escXml(items[i])}</a:t></a:r></a:p>`;
+    }
+
+    const xml = `<p:sp xmlns:p="${nsP}" xmlns:a="${nsA}">
+  <p:nvSpPr>
+    <p:cNvPr id="${newId}" name="TextBox ${newId}"/>
+    <p:cNvSpPr txBox="1"><a:spLocks noGrp="1"/></p:cNvSpPr>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
     <a:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm>
     <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
-    <a:noFill/>
+    ${fillXml}
   </p:spPr>
   <p:txBody>
     <a:bodyPr wrap="square" rtlCol="0"><a:spAutoFit/></a:bodyPr>
     <a:lstStyle/>
-    <a:p>
-      <a:pPr algn="${align}"/>
-      <a:r>
-        <a:rPr lang="en-US" sz="${fontSize}" b="${bold ? 1 : 0}" dirty="0">
-          <a:solidFill><a:srgbClr val="${color}"/></a:solidFill>
-          <a:latin typeface="${fontFamily}"/>
-        </a:rPr>
-        <a:t>${text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</a:t>
-      </a:r>
-    </a:p>
+    ${parasXml}
   </p:txBody>
 </p:sp>`;
 
@@ -764,6 +1342,53 @@ export class PptxWriter {
     return this;
   }
 
+  /**
+   * Set a theme font (major = headings, minor = body text).
+   * These are the fonts that shapes using theme fonts (+mj-lt, +mn-lt) will
+   * resolve to. You can also pass any custom font name — PowerPoint will use
+   * the font if available on the system, or substitute a fallback.
+   *
+   * @param {'major'|'minor'} kind  'major' (headings) or 'minor' (body)
+   * @param {string} fontFamily     e.g. 'Montserrat', 'Georgia', 'Comic Sans MS'
+   * @returns {PptxWriter}
+   *
+   * @example
+   *   writer.setThemeFont('major', 'Montserrat');  // headings
+   *   writer.setThemeFont('minor', 'Open Sans');    // body text
+   */
+  setThemeFont(kind, fontFamily) {
+    const presRels = this._presRels;
+    let themePath = Object.values(presRels).find(r => r.type?.includes('theme'))?.fullPath;
+
+    if (!themePath) {
+      const masterRel = Object.values(presRels).find(r => r.type?.includes('slideMaster'));
+      if (masterRel) {
+        const mr = parseRels(this._files, masterRel.fullPath);
+        themePath = Object.values(mr).find(r => r.type?.includes('theme'))?.fullPath;
+      }
+    }
+    if (!themePath) return this;
+
+    const doc = readXml(this._files, themePath);
+    if (!doc) return this;
+
+    // Find the fontScheme > majorFont/minorFont > latin element
+    const fontScheme = g1(doc, 'fontScheme');
+    if (!fontScheme) return this;
+
+    const target = kind === 'major' ? 'majorFont' : 'minorFont';
+    const fontEl = g1(fontScheme, target);
+    if (!fontEl) return this;
+
+    const latin = g1(fontEl, 'latin');
+    if (latin) {
+      latin.setAttribute('typeface', fontFamily);
+    }
+
+    this._files[themePath] = xmlBytes(doc);
+    return this;
+  }
+
   // ── Slide operations ──────────────────────────────────────────────────────────
 
   /**
@@ -872,6 +1497,87 @@ export class PptxWriter {
   }
 
   /**
+   * Add a new blank slide.
+   * @param {number} [atIdx]  insert position (default: end)
+   * @returns {PptxWriter}
+   */
+  addSlide(atIdx) {
+    const insertAt = atIdx ?? this._slidePaths.length;
+
+    // Find next available slide number
+    const nums = Object.keys(this._files)
+      .map(p => p.match(/ppt\/slides\/slide(\d+)\.xml/))
+      .filter(Boolean).map(m => parseInt(m[1], 10));
+    const nextNum = (nums.length ? Math.max(...nums) : 0) + 1;
+
+    const newSlidePath = `ppt/slides/slide${nextNum}.xml`;
+    const nsP = NS.p, nsA = NS.a;
+
+    this._files[newSlidePath] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:p="${nsP}" xmlns:a="${nsA}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+    </p:spTree>
+  </p:cSld>
+</p:sld>`);
+
+    // Point the new slide at a layout (use the first layout available)
+    const layoutTarget = Object.keys(this._files).find(p => p.match(/ppt\/slideLayouts\/slideLayout\d+\.xml/));
+    const layoutRelTarget = layoutTarget ? '../slideLayouts/' + layoutTarget.split('/').pop() : '../slideLayouts/slideLayout1.xml';
+    this._files[relsPath(newSlidePath)] = enc.encode(
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="${layoutRelTarget}"/>
+</Relationships>`);
+
+    // Add relationship in presentation.xml.rels
+    const newRId = nextRId(this._presRels);
+    this._presRels[newRId] = {
+      id: newRId,
+      type: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide',
+      target: `slides/slide${nextNum}.xml`,
+      fullPath: newSlidePath,
+    };
+    this._savePresRels();
+
+    // Add sldId to presentation.xml
+    const sldIdLst = g1(this._presDoc, 'sldIdLst');
+    if (sldIdLst) {
+      const ids = gtn(sldIdLst, 'sldId').map(el => parseInt(el.getAttribute('id') || '0', 10));
+      const nextId = (ids.length ? Math.max(...ids) : 255) + 1;
+      const sldIdEl = this._presDoc.createElementNS(NS.p, 'p:sldId');
+      sldIdEl.setAttribute('id', String(nextId));
+      sldIdEl.setAttributeNS(NS.r, 'r:id', newRId);
+
+      const children = Array.from(sldIdLst.children);
+      if (insertAt >= children.length) {
+        sldIdLst.appendChild(sldIdEl);
+      } else {
+        sldIdLst.insertBefore(sldIdEl, children[insertAt]);
+      }
+    }
+    this._savePresDoc();
+    this._slidePaths = this._buildSlidePaths();
+
+    // Add content type
+    const ctPath = '[Content_Types].xml';
+    const ctDoc  = readXml(this._files, ctPath);
+    if (ctDoc) {
+      const root = ctDoc.documentElement;
+      const ov   = ctDoc.createElementNS(NS.ct, 'Override');
+      ov.setAttribute('PartName',    '/' + newSlidePath);
+      ov.setAttribute('ContentType', 'application/vnd.openxmlformats-officedocument.presentationml.slide+xml');
+      root.appendChild(ov);
+      this._files[ctPath] = xmlBytes(ctDoc);
+    }
+
+    return this;
+  }
+
+  /**
    * Reorder slides.
    * @param {number[]} newOrder  e.g. [2, 0, 1] to put slide 2 first
    */
@@ -960,6 +1666,128 @@ export class PptxWriter {
       fullPath: notesPath,
     };
     this._files[relsPath(slidePath)] = xmlBytes(buildRelsDoc(slideRels));
+  }
+
+  // ── Font embedding ──────────────────────────────────────────────────────────
+
+  /**
+   * Embed a font file (TTF, OTF, WOFF, WOFF2) directly into the PPTX.
+   *
+   * The font is stored as an embedded font resource inside the PPTX so that
+   * the exact typeface is available when the file is opened, even on systems
+   * that don't have the font installed.
+   *
+   * PowerPoint stores embedded fonts as .fntdata files in ppt/fonts/ with
+   * XOR obfuscation per ECMA-376 §15.2.12.
+   *
+   * @param {string} family — font family name as used in the presentation
+   * @param {ArrayBuffer|Uint8Array} fontBytes — raw TTF/OTF/WOFF/WOFF2 bytes
+   * @param {object} [opts]
+   * @param {string} [opts.weight='400']  — '400' (regular) or '700' (bold)
+   * @param {string} [opts.style='normal'] — 'normal' or 'italic'
+   * @returns {PptxWriter}
+   *
+   * @example
+   * const fontBuf = await fetch('/fonts/brand.ttf').then(r => r.arrayBuffer());
+   * writer.embedFont('Brand Sans', fontBuf);
+   * writer.embedFont('Brand Sans', boldBuf, { weight: '700' });
+   * writer.embedFont('Brand Sans', italicBuf, { style: 'italic' });
+   */
+  embedFont(family, fontBytes, opts = {}) {
+    const weight = opts.weight || '400';
+    const style  = opts.style  || 'normal';
+
+    const raw = fontBytes instanceof Uint8Array ? fontBytes : new Uint8Array(fontBytes);
+
+    // Determine variant slot name
+    const isBold   = weight === '700' || weight === 'bold';
+    const isItalic = style === 'italic';
+    let variant;
+    if (isBold && isItalic) variant = 'boldItalic';
+    else if (isBold)        variant = 'bold';
+    else if (isItalic)      variant = 'italic';
+    else                    variant = 'regular';
+
+    // Generate a GUID for the relationship
+    const guid = _generateGuid();
+
+    // Derive obfuscation key from GUID and XOR the first 32 bytes
+    const key32 = _guidToKey(guid);
+    const obfuscated = new Uint8Array(raw);
+    for (let i = 0; i < Math.min(32, obfuscated.length); i++) {
+      obfuscated[i] ^= key32[i];
+    }
+
+    // Store the font data in ppt/fonts/
+    const fontIdx = Object.keys(this._files).filter(p => p.startsWith('ppt/fonts/')).length + 1;
+    const fontPath = `ppt/fonts/font${fontIdx}.fntdata`;
+    this._files[fontPath] = obfuscated;
+
+    // Add content type for .fntdata
+    const ctDoc = readXml(this._files, '[Content_Types].xml');
+    if (ctDoc) {
+      const existing = [...ctDoc.documentElement.children].some(
+        el => el.getAttribute('Extension') === 'fntdata'
+      );
+      if (!existing) {
+        const defEl = ctDoc.createElementNS(NS.ct, 'Default');
+        defEl.setAttribute('Extension', 'fntdata');
+        defEl.setAttribute('ContentType', 'application/x-fontdata');
+        ctDoc.documentElement.appendChild(defEl);
+        this._files['[Content_Types].xml'] = xmlBytes(ctDoc);
+      }
+    }
+
+    // Add relationship in presentation.xml.rels
+    const newRId = nextRId(this._presRels);
+    this._presRels[newRId] = {
+      id: newRId,
+      type: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/font',
+      target: `fonts/font${fontIdx}.fntdata`,
+      fullPath: fontPath,
+    };
+    this._files[relsPath(this._presPath)] = xmlBytes(buildRelsDoc(this._presRels));
+
+    // Add <p:embeddedFont> entry in presentation.xml
+    let embFontLst = g1(this._presDoc, 'embeddedFontLst');
+    if (!embFontLst) {
+      embFontLst = this._presDoc.createElementNS(NS.p, 'p:embeddedFontLst');
+      // Insert after sldIdLst or at start of presentation
+      const sldIdLst = g1(this._presDoc, 'sldIdLst');
+      if (sldIdLst && sldIdLst.nextSibling) {
+        sldIdLst.parentNode.insertBefore(embFontLst, sldIdLst.nextSibling);
+      } else {
+        this._presDoc.documentElement.appendChild(embFontLst);
+      }
+    }
+
+    // Check if this family already has an embeddedFont element
+    let embFont = null;
+    for (const ef of [...embFontLst.children]) {
+      if (ef.localName !== 'embeddedFont') continue;
+      const fontEl = g1(ef, 'font');
+      if (fontEl && fontEl.getAttribute('typeface') === family) {
+        embFont = ef;
+        break;
+      }
+    }
+    if (!embFont) {
+      embFont = this._presDoc.createElementNS(NS.p, 'p:embeddedFont');
+      const fontEl = this._presDoc.createElementNS(NS.p, 'p:font');
+      fontEl.setAttribute('typeface', family);
+      embFont.appendChild(fontEl);
+      embFontLst.appendChild(embFont);
+    }
+
+    // Add variant element
+    const varEl = this._presDoc.createElementNS(NS.p, `p:${variant}`);
+    varEl.setAttributeNS(NS.r, 'r:id', newRId);
+    embFont.appendChild(varEl);
+
+    // Save updated presentation.xml
+    this._files[this._presPath] = xmlBytes(this._presDoc);
+
+    return this;
   }
 
   // ── Serialisation ─────────────────────────────────────────────────────────────

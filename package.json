@@ -1,7 +1,7 @@
 {
   "name": "pptx-browser",
   "version": "4.1.5",
-  "description": "Render, edit, and export PowerPoint (PPTX) slides. Canvas rendering, SVG export, PDF export, PPTX writer/template engine, slide show, text extraction, animations. Zero dependencies.",
+  "description": "Render, edit, create, and export PowerPoint (PPTX) and ODP slides. Canvas rendering, SVG export, PDF export, PPTX/ODP writer, template engine, slide show, text extraction, animations. Zero dependencies.",
   "type": "module",
   "main": "./src/index.js",
   "module": "./src/index.js",
@@ -14,7 +14,8 @@
     "./slideshow": "./src/slideshow.js",
     "./extract": "./src/extract.js",
     "./clipboard": "./src/clipboard.js",
-    "./zip-writer": "./src/zip-writer.js"
+    "./zip-writer": "./src/zip-writer.js",
+    "./odp": "./src/odp.js"
   },
   "files": [
     "src/",
@@ -30,7 +31,11 @@
     "presentation",
     "renderer",
     "editor",
-    "template"
+    "template",
+    "odp",
+    "opendocument",
+    "libreoffice",
+    "create"
   ],
   "author": "",
   "license": "MIT",
