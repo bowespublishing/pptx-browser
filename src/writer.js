@@ -45,6 +45,7 @@
  *
  * ── API reference ─────────────────────────────────────────────────────────────
  *
+ *   PptxWriter.create(opts)               — create from scratch (blank slide)
  *   PptxWriter.fromRenderer(renderer)     — clone from loaded PptxRenderer
  *   PptxWriter.fromBytes(buffer)          — parse PPTX bytes fresh
  *
@@ -52,11 +53,15 @@
  *   .replaceText(find, replace, opts)     — global find-and-replace
  *   .setShapeText(slideIdx, name, text)   — set text of named shape
  *   .getShapeText(slideIdx, name)         — read text from named shape
- *   .addTextBox(slideIdx, text, style)    — add a new text box
+ *   .addTextBox(slideIdx, text, style)    — add text box (italic/underline/fill/…)
+ *   .addRichText(slideIdx, paragraphs, style)  — mixed-format text runs
+ *   .addShape(slideIdx, type, style)      — preset shape with optional text
+ *   .addList(slideIdx, items, style)      — bullet/numbered list
  *   .setShapeImage(slideIdx, name, bytes, mime)  — swap shape image
  *   .addImage(slideIdx, bytes, mime, rect)       — add new image shape
  *   .setSlideBackground(slideIdx, color)         — solid background color
  *   .setThemeColor(key, hexRgb)           — change theme colour (no #)
+ *   .addSlide(atIdx?)                     — add a blank slide
  *   .duplicateSlide(fromIdx, toIdx?)      — copy slide
  *   .removeSlide(slideIdx)                — delete slide
  *   .reorderSlides(newOrder)              — reorder by index array
@@ -690,35 +695,66 @@ export class PptxWriter {
    * Add a new text box to a slide.
    *
    * @param {number} slideIdx
-   * @param {string} text
+   * @param {string} text          use \n for line breaks
    * @param {object} style
-   * @param {number} style.x      EMU from left edge
-   * @param {number} style.y      EMU from top edge
-   * @param {number} style.w      EMU width
-   * @param {number} style.h      EMU height
-   * @param {string} [style.color]      hex colour, no #
-   * @param {number} [style.fontSize]   pt * 100  (e.g. 2400 = 24pt)
+   * @param {number} style.x           EMU from left edge
+   * @param {number} style.y           EMU from top edge
+   * @param {number} style.w           EMU width
+   * @param {number} style.h           EMU height
+   * @param {string} [style.color]     hex colour, no #
+   * @param {number} [style.fontSize]  pt * 100  (e.g. 2400 = 24pt)
    * @param {boolean}[style.bold]
-   * @param {string} [style.align]      l|ctr|r
+   * @param {boolean}[style.italic]
+   * @param {boolean}[style.underline]
+   * @param {boolean}[style.strikethrough]
+   * @param {string} [style.align]     l|ctr|r|just
+   * @param {string} [style.vertAlign] t|ctr|b  (vertical alignment)
    * @param {string} [style.fontFamily]
+   * @param {string} [style.fill]      shape background, hex no #
+   * @param {string} [style.outline]   border colour, hex no #
+   * @param {number} [style.outlineWidth] border width EMU (default 12700 = 1pt)
+   * @param {number} [style.lineSpacing]  line spacing in hundredths of a percent (e.g. 150000 = 150%)
+   * @param {number} [style.rotation]     rotation in 60000ths of a degree (e.g. 5400000 = 90°)
    */
   addTextBox(slideIdx, text, style = {}) {
     const {
       x = 914400, y = 914400, w = 4572000, h = 914400,
       color = '000000', fontSize = 1800, bold = false,
-      align = 'l', fontFamily = 'Calibri',
+      italic = false, underline = false, strikethrough = false,
+      align = 'l', vertAlign, fontFamily = 'Calibri',
+      fill, outline, outlineWidth = 12700, lineSpacing, rotation,
     } = style;
 
     const doc    = this._slideDoc(slideIdx);
     const spTree = getSpTree(doc);
     if (!spTree) return this;
 
-    // Next shape ID
     const maxId = Math.max(0, ...gtn(spTree, 'cNvPr').map(e => parseInt(e.getAttribute('id') || '0', 10)));
     const newId = maxId + 1;
     const name  = `TextBox ${newId}`;
-
     const nsA = NS.a, nsP = NS.p;
+
+    const fillXml = fill
+      ? `<a:solidFill><a:srgbClr val="${fill}"/></a:solidFill>`
+      : `<a:noFill/>`;
+    const lnXml = outline
+      ? `<a:ln w="${outlineWidth}"><a:solidFill><a:srgbClr val="${outline}"/></a:solidFill></a:ln>`
+      : '';
+    const rotAttr = rotation ? ` rot="${rotation}"` : '';
+    const anchorAttr = vertAlign ? ` anchor="${vertAlign}"` : '';
+    const spcAttr = lineSpacing
+      ? `<a:lnSpc><a:spcPct val="${lineSpacing}"/></a:lnSpc>`
+      : '';
+
+    const lines = text.split('\n');
+    const parasXml = lines.map(line =>
+      `<a:p><a:pPr algn="${align}">${spcAttr}</a:pPr>` +
+      `<a:r><a:rPr lang="en-US" sz="${fontSize}" b="${bold ? 1 : 0}" i="${italic ? 1 : 0}"` +
+      `${underline ? ' u="sng"' : ''}${strikethrough ? ' strike="sngStrike"' : ''} dirty="0">` +
+      `<a:solidFill><a:srgbClr val="${color}"/></a:solidFill>` +
+      `<a:latin typeface="${escXml(fontFamily)}"/>` +
+      `</a:rPr><a:t>${escXml(line)}</a:t></a:r></a:p>`
+    ).join('');
 
     const xml = `<p:sp xmlns:p="${nsP}" xmlns:a="${nsA}">
   <p:nvSpPr>
@@ -727,23 +763,283 @@ export class PptxWriter {
     <p:nvPr/>
   </p:nvSpPr>
   <p:spPr>
+    <a:xfrm${rotAttr}><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+    ${fillXml}${lnXml}
+  </p:spPr>
+  <p:txBody>
+    <a:bodyPr wrap="square" rtlCol="0"${anchorAttr}><a:spAutoFit/></a:bodyPr>
+    <a:lstStyle/>
+    ${parasXml}
+  </p:txBody>
+</p:sp>`;
+
+    const frag = parseXml(xml);
+    spTree.appendChild(doc.adoptNode(frag.documentElement));
+    this._saveSlideDoc(slideIdx, doc);
+    return this;
+  }
+
+  /**
+   * Add a text box with mixed formatting (rich text).
+   * Each run can have its own font, size, colour, bold, italic, etc.
+   *
+   * @param {number} slideIdx
+   * @param {Array<Array<{text, color?, fontSize?, bold?, italic?, underline?, strikethrough?, fontFamily?}>>} paragraphs
+   *   Array of paragraphs, each paragraph is an array of run objects.
+   * @param {object} style
+   * @param {number} style.x        EMU from left
+   * @param {number} style.y        EMU from top
+   * @param {number} style.w        EMU width
+   * @param {number} style.h        EMU height
+   * @param {string} [style.align]  l|ctr|r|just
+   * @param {string} [style.vertAlign] t|ctr|b
+   * @param {string} [style.fill]   shape fill hex
+   * @param {string} [style.outline] border hex
+   * @param {number} [style.outlineWidth]
+   * @param {number} [style.lineSpacing]
+   * @param {number} [style.rotation]
+   *
+   * @example
+   *   writer.addRichText(0, [
+   *     [
+   *       { text: 'Bold title', bold: true, fontSize: 3200, color: '1F4E79' },
+   *     ],
+   *     [
+   *       { text: 'Normal text ', fontSize: 1800 },
+   *       { text: 'with red highlight', fontSize: 1800, color: 'FF0000', italic: true },
+   *     ],
+   *   ], { x: 914400, y: 914400, w: 7000000, h: 2000000 });
+   */
+  addRichText(slideIdx, paragraphs, style = {}) {
+    const {
+      x = 914400, y = 914400, w = 4572000, h = 914400,
+      align = 'l', vertAlign, fill, outline, outlineWidth = 12700,
+      lineSpacing, rotation,
+    } = style;
+
+    const doc    = this._slideDoc(slideIdx);
+    const spTree = getSpTree(doc);
+    if (!spTree) return this;
+
+    const maxId = Math.max(0, ...gtn(spTree, 'cNvPr').map(e => parseInt(e.getAttribute('id') || '0', 10)));
+    const newId = maxId + 1;
+    const nsA = NS.a, nsP = NS.p;
+
+    const fillXml = fill
+      ? `<a:solidFill><a:srgbClr val="${fill}"/></a:solidFill>`
+      : `<a:noFill/>`;
+    const lnXml = outline
+      ? `<a:ln w="${outlineWidth}"><a:solidFill><a:srgbClr val="${outline}"/></a:solidFill></a:ln>`
+      : '';
+    const rotAttr = rotation ? ` rot="${rotation}"` : '';
+    const anchorAttr = vertAlign ? ` anchor="${vertAlign}"` : '';
+    const spcXml = lineSpacing ? `<a:lnSpc><a:spcPct val="${lineSpacing}"/></a:lnSpc>` : '';
+
+    let parasXml = '';
+    for (const para of paragraphs) {
+      parasXml += `<a:p><a:pPr algn="${align}">${spcXml}</a:pPr>`;
+      for (const run of para) {
+        const sz = run.fontSize ?? 1800;
+        const clr = run.color ?? '000000';
+        const ff = run.fontFamily ?? 'Calibri';
+        parasXml += `<a:r><a:rPr lang="en-US" sz="${sz}" b="${run.bold ? 1 : 0}" i="${run.italic ? 1 : 0}"` +
+          `${run.underline ? ' u="sng"' : ''}${run.strikethrough ? ' strike="sngStrike"' : ''} dirty="0">` +
+          `<a:solidFill><a:srgbClr val="${clr}"/></a:solidFill>` +
+          `<a:latin typeface="${escXml(ff)}"/>` +
+          `</a:rPr><a:t>${escXml(run.text)}</a:t></a:r>`;
+      }
+      parasXml += `</a:p>`;
+    }
+
+    const xml = `<p:sp xmlns:p="${nsP}" xmlns:a="${nsA}">
+  <p:nvSpPr>
+    <p:cNvPr id="${newId}" name="TextBox ${newId}"/>
+    <p:cNvSpPr txBox="1"><a:spLocks noGrp="1"/></p:cNvSpPr>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
+    <a:xfrm${rotAttr}><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+    ${fillXml}${lnXml}
+  </p:spPr>
+  <p:txBody>
+    <a:bodyPr wrap="square" rtlCol="0"${anchorAttr}><a:spAutoFit/></a:bodyPr>
+    <a:lstStyle/>
+    ${parasXml}
+  </p:txBody>
+</p:sp>`;
+
+    const frag = parseXml(xml);
+    spTree.appendChild(doc.adoptNode(frag.documentElement));
+    this._saveSlideDoc(slideIdx, doc);
+    return this;
+  }
+
+  /**
+   * Add a preset shape (rectangle, ellipse, arrow, etc.) to a slide.
+   *
+   * @param {number} slideIdx
+   * @param {string} shapeType   preset geometry name:
+   *   rect, roundRect, ellipse, triangle, diamond, pentagon, hexagon,
+   *   star5, star6, rightArrow, leftArrow, upArrow, downArrow,
+   *   heart, cloud, line, plus, can, cube, donut, …
+   *   (any PowerPoint preset geometry name)
+   * @param {object} style
+   * @param {number} style.x           EMU from left
+   * @param {number} style.y           EMU from top
+   * @param {number} style.w           EMU width
+   * @param {number} style.h           EMU height
+   * @param {string} [style.fill='4472C4']   fill colour hex, no #
+   * @param {string} [style.outline]         border colour hex
+   * @param {number} [style.outlineWidth=12700]
+   * @param {string} [style.text]      optional text inside the shape
+   * @param {string} [style.textColor='FFFFFF']
+   * @param {number} [style.fontSize=1800]   pt * 100
+   * @param {boolean}[style.bold]
+   * @param {boolean}[style.italic]
+   * @param {string} [style.fontFamily='Calibri']
+   * @param {string} [style.align='ctr']
+   * @param {string} [style.vertAlign='ctr']  t|ctr|b
+   * @param {number} [style.rotation]
+   */
+  addShape(slideIdx, shapeType, style = {}) {
+    const {
+      x = 914400, y = 914400, w = 2743200, h = 2743200,
+      fill = '4472C4', outline, outlineWidth = 12700,
+      text, textColor = 'FFFFFF', fontSize = 1800,
+      bold = false, italic = false, fontFamily = 'Calibri',
+      align = 'ctr', vertAlign = 'ctr', rotation,
+    } = style;
+
+    const doc    = this._slideDoc(slideIdx);
+    const spTree = getSpTree(doc);
+    if (!spTree) return this;
+
+    const maxId = Math.max(0, ...gtn(spTree, 'cNvPr').map(e => parseInt(e.getAttribute('id') || '0', 10)));
+    const newId = maxId + 1;
+    const nsA = NS.a, nsP = NS.p;
+
+    const fillXml = fill
+      ? `<a:solidFill><a:srgbClr val="${fill}"/></a:solidFill>`
+      : `<a:noFill/>`;
+    const lnXml = outline
+      ? `<a:ln w="${outlineWidth}"><a:solidFill><a:srgbClr val="${outline}"/></a:solidFill></a:ln>`
+      : '';
+    const rotAttr = rotation ? ` rot="${rotation}"` : '';
+
+    let txBodyXml = '';
+    if (text !== undefined && text !== null) {
+      txBodyXml = `<p:txBody>
+    <a:bodyPr wrap="square" rtlCol="0" anchor="${vertAlign}"/>
+    <a:lstStyle/>
+    <a:p><a:pPr algn="${align}"/>
+      <a:r><a:rPr lang="en-US" sz="${fontSize}" b="${bold ? 1 : 0}" i="${italic ? 1 : 0}" dirty="0">
+        <a:solidFill><a:srgbClr val="${textColor}"/></a:solidFill>
+        <a:latin typeface="${escXml(fontFamily)}"/>
+      </a:rPr><a:t>${escXml(text)}</a:t></a:r>
+    </a:p>
+  </p:txBody>`;
+    }
+
+    const xml = `<p:sp xmlns:p="${nsP}" xmlns:a="${nsA}">
+  <p:nvSpPr>
+    <p:cNvPr id="${newId}" name="${shapeType} ${newId}"/>
+    <p:cNvSpPr/>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
+    <a:xfrm${rotAttr}><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm>
+    <a:prstGeom prst="${escXml(shapeType)}"><a:avLst/></a:prstGeom>
+    ${fillXml}${lnXml}
+  </p:spPr>
+  ${txBodyXml}
+</p:sp>`;
+
+    const frag = parseXml(xml);
+    spTree.appendChild(doc.adoptNode(frag.documentElement));
+    this._saveSlideDoc(slideIdx, doc);
+    return this;
+  }
+
+  /**
+   * Add a bulleted or numbered list to a slide.
+   *
+   * @param {number} slideIdx
+   * @param {string[]} items     list items (strings)
+   * @param {object}   style
+   * @param {number}   style.x         EMU from left
+   * @param {number}   style.y         EMU from top
+   * @param {number}   style.w         EMU width
+   * @param {number}   style.h         EMU height
+   * @param {string}   [style.color='000000']
+   * @param {number}   [style.fontSize=1800]   pt * 100
+   * @param {boolean}  [style.bold]
+   * @param {boolean}  [style.italic]
+   * @param {string}   [style.fontFamily='Calibri']
+   * @param {string}   [style.bulletChar='•']  set to '' for no bullet, or '1' for numbered
+   * @param {string}   [style.bulletColor]     hex, defaults to text color
+   * @param {string}   [style.fill]            background fill hex
+   * @param {string}   [style.align='l']
+   */
+  addList(slideIdx, items, style = {}) {
+    const {
+      x = 914400, y = 914400, w = 7000000, h = 3000000,
+      color = '000000', fontSize = 1800, bold = false, italic = false,
+      fontFamily = 'Calibri', bulletChar = '\u2022',
+      bulletColor, fill, align = 'l',
+    } = style;
+
+    const doc    = this._slideDoc(slideIdx);
+    const spTree = getSpTree(doc);
+    if (!spTree) return this;
+
+    const maxId = Math.max(0, ...gtn(spTree, 'cNvPr').map(e => parseInt(e.getAttribute('id') || '0', 10)));
+    const newId = maxId + 1;
+    const nsA = NS.a, nsP = NS.p;
+    const bClr = bulletColor || color;
+
+    const fillXml = fill
+      ? `<a:solidFill><a:srgbClr val="${fill}"/></a:solidFill>`
+      : `<a:noFill/>`;
+
+    const isNumbered = bulletChar === '1';
+
+    let parasXml = '';
+    for (let i = 0; i < items.length; i++) {
+      let bulletXml;
+      if (isNumbered) {
+        bulletXml = `<a:buFont typeface="+mj-lt"/><a:buAutoNum type="arabicPeriod"/>`;
+      } else if (bulletChar) {
+        bulletXml = `<a:buClr><a:srgbClr val="${bClr}"/></a:buClr>` +
+          `<a:buSzPct val="100000"/>` +
+          `<a:buChar char="${escXml(bulletChar)}"/>`;
+      } else {
+        bulletXml = '<a:buNone/>';
+      }
+
+      parasXml += `<a:p><a:pPr algn="${align}" marL="342900" indent="-342900">${bulletXml}</a:pPr>` +
+        `<a:r><a:rPr lang="en-US" sz="${fontSize}" b="${bold ? 1 : 0}" i="${italic ? 1 : 0}" dirty="0">` +
+        `<a:solidFill><a:srgbClr val="${color}"/></a:solidFill>` +
+        `<a:latin typeface="${escXml(fontFamily)}"/>` +
+        `</a:rPr><a:t>${escXml(items[i])}</a:t></a:r></a:p>`;
+    }
+
+    const xml = `<p:sp xmlns:p="${nsP}" xmlns:a="${nsA}">
+  <p:nvSpPr>
+    <p:cNvPr id="${newId}" name="TextBox ${newId}"/>
+    <p:cNvSpPr txBox="1"><a:spLocks noGrp="1"/></p:cNvSpPr>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
     <a:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="${w}" cy="${h}"/></a:xfrm>
     <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
-    <a:noFill/>
+    ${fillXml}
   </p:spPr>
   <p:txBody>
     <a:bodyPr wrap="square" rtlCol="0"><a:spAutoFit/></a:bodyPr>
     <a:lstStyle/>
-    <a:p>
-      <a:pPr algn="${align}"/>
-      <a:r>
-        <a:rPr lang="en-US" sz="${fontSize}" b="${bold ? 1 : 0}" dirty="0">
-          <a:solidFill><a:srgbClr val="${color}"/></a:solidFill>
-          <a:latin typeface="${fontFamily}"/>
-        </a:rPr>
-        <a:t>${text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</a:t>
-      </a:r>
-    </a:p>
+    ${parasXml}
   </p:txBody>
 </p:sp>`;
 

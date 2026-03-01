@@ -30,7 +30,10 @@
  *
  *   .addSlide()                         — add a blank slide
  *   .removeSlide(idx)                   — remove a slide
- *   .addTextBox(slideIdx, text, style)  — add text box (cm units)
+ *   .addTextBox(slideIdx, text, style)  — text box (italic/underline/fill/…)
+ *   .addRichText(slideIdx, paras, style) — mixed-format text runs
+ *   .addShape(slideIdx, type, style)    — preset shape with optional text
+ *   .addList(slideIdx, items, style)    — bullet/numbered list
  *   .addImage(slideIdx, bytes, mime, rect) — add image (cm units)
  *   .setSlideBackground(slideIdx, hex)  — solid background
  *   .getSlideCount()                    — number of slides
@@ -229,45 +232,63 @@ export class OdpWriter {
    * @param {number} slideIdx
    * @param {string} text       use \n for line breaks
    * @param {object} [style]
-   * @param {number} [style.x=2]         cm from left
-   * @param {number} [style.y=2]         cm from top
-   * @param {number} [style.w=20]        cm width
-   * @param {number} [style.h=3]         cm height
-   * @param {string} [style.color='000000']   hex, no #
-   * @param {number} [style.fontSize=18]      pt
+   * @param {number} [style.x=2]             cm from left
+   * @param {number} [style.y=2]             cm from top
+   * @param {number} [style.w=20]            cm width
+   * @param {number} [style.h=3]             cm height
+   * @param {string} [style.color='000000']  hex, no #
+   * @param {number} [style.fontSize=18]     pt
    * @param {boolean}[style.bold=false]
-   * @param {string} [style.align='start']    start|center|end
+   * @param {boolean}[style.italic=false]
+   * @param {boolean}[style.underline=false]
+   * @param {boolean}[style.strikethrough=false]
+   * @param {string} [style.align='start']   start|center|end|justify
    * @param {string} [style.fontFamily='Calibri']
+   * @param {string} [style.fill]            shape background hex, no #
+   * @param {string} [style.outline]         border colour hex, no #
+   * @param {number} [style.outlineWidth=0.035] border width in cm
+   * @param {number} [style.lineSpacing]     line height as multiplier (e.g. 1.5)
+   * @param {number} [style.rotation]        degrees (e.g. 90)
    * @returns {OdpWriter}
    */
   addTextBox(slideIdx, text, style = {}) {
     const {
       x = 2, y = 2, w = 20, h = 3,
       color = '000000', fontSize = 18,
-      bold = false, align = 'start',
-      fontFamily = 'Calibri',
+      bold = false, italic = false, underline = false,
+      strikethrough = false, align = 'start',
+      fontFamily = 'Calibri', fill, outline,
+      outlineWidth = 0.035, lineSpacing, rotation,
     } = style;
 
     const slide = this._slides[slideIdx];
     if (!slide) throw new RangeError(`Slide ${slideIdx} out of range`);
 
-    // Create a graphic style for the text box frame
+    const fillProp = fill
+      ? `draw:fill="solid" draw:fill-color="#${fill}"`
+      : 'draw:fill="none"';
+    const strokeProp = outline
+      ? `draw:stroke="solid" svg:stroke-color="#${outline}" svg:stroke-width="${cm(outlineWidth)}"`
+      : 'draw:stroke="none"';
+
     const frameStyleName = this._addStyle(
       'graphic',
-      `<style:graphic-properties svg:stroke-color="#000000" draw:stroke="none" draw:fill="none" draw:auto-grow-height="true"/>`,
+      `<style:graphic-properties ${fillProp} ${strokeProp} draw:auto-grow-height="true"/>`,
     );
 
-    // Create a paragraph style
+    const spcProp = lineSpacing ? ` fo:line-height="${Math.round(lineSpacing * 100)}%"` : '';
     const paraStyleName = this._addStyle(
       'paragraph',
-      `<style:paragraph-properties fo:text-align="${align}"/>`,
+      `<style:paragraph-properties fo:text-align="${align}"${spcProp}/>`,
     );
 
-    // Create a text style
     const textStyleName = this._addStyle(
       'text',
       `<style:text-properties fo:font-size="${fontSize}pt" fo:color="#${color}"` +
       (bold ? ' fo:font-weight="bold"' : '') +
+      (italic ? ' fo:font-style="italic"' : '') +
+      (underline ? ' style:text-underline-style="solid" style:text-underline-width="auto"' : '') +
+      (strikethrough ? ' style:text-line-through-style="solid"' : '') +
       ` style:font-name="${escXml(fontFamily)}"/>`,
     );
 
@@ -278,12 +299,302 @@ export class OdpWriter {
       `</text:p>`
     ).join('');
 
+    const rotAttr = rotation ? ` draw:transform="rotate(${(-rotation * Math.PI / 180).toFixed(6)})"` : '';
+
     slide.shapes.push({
       type: 'frame',
       xml: `<draw:frame draw:style-name="${frameStyleName}" ` +
-           `svg:x="${cm(x)}" svg:y="${cm(y)}" svg:width="${cm(w)}" svg:height="${cm(h)}" ` +
-           `presentation:class="subtitle">` +
+           `svg:x="${cm(x)}" svg:y="${cm(y)}" svg:width="${cm(w)}" svg:height="${cm(h)}"${rotAttr}>` +
            `<draw:text-box>${parasXml}</draw:text-box>` +
+           `</draw:frame>`,
+    });
+
+    return this;
+  }
+
+  /**
+   * Add a text box with mixed formatting (rich text).
+   * Each run can have its own font, size, colour, bold, italic, etc.
+   *
+   * @param {number} slideIdx
+   * @param {Array<Array<{text, color?, fontSize?, bold?, italic?, underline?, strikethrough?, fontFamily?}>>} paragraphs
+   *   Array of paragraphs, each paragraph is an array of run objects.
+   * @param {object} style
+   * @param {number} style.x        cm from left
+   * @param {number} style.y        cm from top
+   * @param {number} style.w        cm width
+   * @param {number} style.h        cm height
+   * @param {string} [style.align='start']
+   * @param {string} [style.fill]   shape fill hex
+   * @param {string} [style.outline] border hex
+   * @param {number} [style.outlineWidth=0.035]
+   * @param {number} [style.lineSpacing]
+   * @param {number} [style.rotation]
+   *
+   * @example
+   *   odp.addRichText(0, [
+   *     [
+   *       { text: 'Bold title', bold: true, fontSize: 32, color: '1F4E79' },
+   *     ],
+   *     [
+   *       { text: 'Normal text ', fontSize: 18 },
+   *       { text: 'with red highlight', fontSize: 18, color: 'FF0000', italic: true },
+   *     ],
+   *   ], { x: 2, y: 2, w: 20, h: 6 });
+   */
+  addRichText(slideIdx, paragraphs, style = {}) {
+    const {
+      x = 2, y = 2, w = 20, h = 3,
+      align = 'start', fill, outline,
+      outlineWidth = 0.035, lineSpacing, rotation,
+    } = style;
+
+    const slide = this._slides[slideIdx];
+    if (!slide) throw new RangeError(`Slide ${slideIdx} out of range`);
+
+    const fillProp = fill
+      ? `draw:fill="solid" draw:fill-color="#${fill}"`
+      : 'draw:fill="none"';
+    const strokeProp = outline
+      ? `draw:stroke="solid" svg:stroke-color="#${outline}" svg:stroke-width="${cm(outlineWidth)}"`
+      : 'draw:stroke="none"';
+
+    const frameStyleName = this._addStyle(
+      'graphic',
+      `<style:graphic-properties ${fillProp} ${strokeProp} draw:auto-grow-height="true"/>`,
+    );
+
+    const spcProp = lineSpacing ? ` fo:line-height="${Math.round(lineSpacing * 100)}%"` : '';
+    const paraStyleName = this._addStyle(
+      'paragraph',
+      `<style:paragraph-properties fo:text-align="${align}"${spcProp}/>`,
+    );
+
+    let parasXml = '';
+    for (const para of paragraphs) {
+      parasXml += `<text:p text:style-name="${paraStyleName}">`;
+      for (const run of para) {
+        const sz = run.fontSize ?? 18;
+        const clr = run.color ?? '000000';
+        const ff = run.fontFamily ?? 'Calibri';
+        const tsName = this._addStyle(
+          'text',
+          `<style:text-properties fo:font-size="${sz}pt" fo:color="#${clr}"` +
+          (run.bold ? ' fo:font-weight="bold"' : '') +
+          (run.italic ? ' fo:font-style="italic"' : '') +
+          (run.underline ? ' style:text-underline-style="solid" style:text-underline-width="auto"' : '') +
+          (run.strikethrough ? ' style:text-line-through-style="solid"' : '') +
+          ` style:font-name="${escXml(ff)}"/>`,
+        );
+        parasXml += `<text:span text:style-name="${tsName}">${escXml(run.text)}</text:span>`;
+      }
+      parasXml += `</text:p>`;
+    }
+
+    const rotAttr = rotation ? ` draw:transform="rotate(${(-rotation * Math.PI / 180).toFixed(6)})"` : '';
+
+    slide.shapes.push({
+      type: 'frame',
+      xml: `<draw:frame draw:style-name="${frameStyleName}" ` +
+           `svg:x="${cm(x)}" svg:y="${cm(y)}" svg:width="${cm(w)}" svg:height="${cm(h)}"${rotAttr}>` +
+           `<draw:text-box>${parasXml}</draw:text-box>` +
+           `</draw:frame>`,
+    });
+
+    return this;
+  }
+
+  /**
+   * Add a preset shape (rectangle, ellipse, etc.) to a slide.
+   *
+   * ODP supports these draw elements:
+   *   rect, ellipse, line, custom-shape
+   *
+   * The `shapeType` param maps common names to ODP elements:
+   *   rect, roundRect → draw:custom-shape  with enhanced geometry
+   *   ellipse         → draw:ellipse
+   *   line            → draw:line
+   *   All others      → draw:custom-shape
+   *
+   * @param {number} slideIdx
+   * @param {string} shapeType  rect|roundRect|ellipse|triangle|diamond|star5|…
+   * @param {object} style
+   * @param {number} style.x            cm from left
+   * @param {number} style.y            cm from top
+   * @param {number} style.w            cm width
+   * @param {number} style.h            cm height
+   * @param {string} [style.fill='4472C4']   fill hex
+   * @param {string} [style.outline]         border hex
+   * @param {number} [style.outlineWidth=0.035]
+   * @param {string} [style.text]       optional text inside shape
+   * @param {string} [style.textColor='FFFFFF']
+   * @param {number} [style.fontSize=18]
+   * @param {boolean}[style.bold]
+   * @param {boolean}[style.italic]
+   * @param {string} [style.fontFamily='Calibri']
+   * @param {string} [style.align='center']
+   * @param {number} [style.rotation]
+   * @returns {OdpWriter}
+   */
+  addShape(slideIdx, shapeType, style = {}) {
+    const {
+      x = 2, y = 2, w = 8, h = 8,
+      fill = '4472C4', outline, outlineWidth = 0.035,
+      text, textColor = 'FFFFFF', fontSize = 18,
+      bold = false, italic = false, fontFamily = 'Calibri',
+      align = 'center', rotation,
+    } = style;
+
+    const slide = this._slides[slideIdx];
+    if (!slide) throw new RangeError(`Slide ${slideIdx} out of range`);
+
+    const fillProp = fill
+      ? `draw:fill="solid" draw:fill-color="#${fill}"`
+      : 'draw:fill="none"';
+    const strokeProp = outline
+      ? `draw:stroke="solid" svg:stroke-color="#${outline}" svg:stroke-width="${cm(outlineWidth)}"`
+      : `draw:stroke="none"`;
+
+    const graphStyleName = this._addStyle(
+      'graphic',
+      `<style:graphic-properties ${fillProp} ${strokeProp}/>`,
+    );
+
+    let textXml = '';
+    if (text !== undefined && text !== null) {
+      const paraStyle = this._addStyle('paragraph',
+        `<style:paragraph-properties fo:text-align="${align}"/>`);
+      const textStyle = this._addStyle('text',
+        `<style:text-properties fo:font-size="${fontSize}pt" fo:color="#${textColor}"` +
+        (bold ? ' fo:font-weight="bold"' : '') +
+        (italic ? ' fo:font-style="italic"' : '') +
+        ` style:font-name="${escXml(fontFamily)}"/>`);
+      textXml = `<text:p text:style-name="${paraStyle}"><text:span text:style-name="${textStyle}">${escXml(text)}</text:span></text:p>`;
+    }
+
+    const rotAttr = rotation ? ` draw:transform="rotate(${(-rotation * Math.PI / 180).toFixed(6)})"` : '';
+    const dims = `draw:style-name="${graphStyleName}" svg:x="${cm(x)}" svg:y="${cm(y)}" svg:width="${cm(w)}" svg:height="${cm(h)}"${rotAttr}`;
+
+    // Map shape types to ODP elements
+    if (shapeType === 'ellipse') {
+      slide.shapes.push({
+        type: 'ellipse',
+        xml: `<draw:ellipse ${dims}>${textXml}</draw:ellipse>`,
+      });
+    } else if (shapeType === 'rect') {
+      slide.shapes.push({
+        type: 'rect',
+        xml: `<draw:rect ${dims}>${textXml}</draw:rect>`,
+      });
+    } else {
+      // Use draw:custom-shape with enhanced-geometry for other shapes
+      const viewBox = '0 0 21600 21600';
+      const geoMap = {
+        roundRect:  `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="round-rectangle" draw:corner-radius="0.5cm"/>`,
+        triangle:   `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="isosceles-triangle"/>`,
+        diamond:    `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="diamond"/>`,
+        pentagon:   `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="pentagon"/>`,
+        hexagon:    `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="hexagon"/>`,
+        star5:      `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="star5"/>`,
+        star6:      `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="star6"/>`,
+        heart:      `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="heart"/>`,
+        cloud:      `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="cloud"/>`,
+        rightArrow: `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="right-arrow"/>`,
+        leftArrow:  `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="left-arrow"/>`,
+        upArrow:    `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="up-arrow"/>`,
+        downArrow:  `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="down-arrow"/>`,
+        plus:       `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="cross"/>`,
+        can:        `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="can"/>`,
+        donut:      `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="ring"/>`,
+      };
+      const geoXml = geoMap[shapeType] || `<draw:enhanced-geometry svg:viewBox="${viewBox}" draw:type="${escXml(shapeType)}"/>`;
+      slide.shapes.push({
+        type: 'custom-shape',
+        xml: `<draw:custom-shape ${dims}>${textXml}${geoXml}</draw:custom-shape>`,
+      });
+    }
+
+    return this;
+  }
+
+  /**
+   * Add a bulleted or numbered list to a slide.
+   *
+   * @param {number}   slideIdx
+   * @param {string[]} items       list items
+   * @param {object}   [style]
+   * @param {number}   [style.x=2]        cm from left
+   * @param {number}   [style.y=2]        cm from top
+   * @param {number}   [style.w=20]       cm width
+   * @param {number}   [style.h=10]       cm height
+   * @param {string}   [style.color='000000']
+   * @param {number}   [style.fontSize=18]    pt
+   * @param {boolean}  [style.bold]
+   * @param {boolean}  [style.italic]
+   * @param {string}   [style.fontFamily='Calibri']
+   * @param {string}   [style.bulletChar='•']  set to '' for no bullet, '1' for numbered
+   * @param {string}   [style.fill]
+   * @param {string}   [style.align='start']
+   * @returns {OdpWriter}
+   */
+  addList(slideIdx, items, style = {}) {
+    const {
+      x = 2, y = 2, w = 20, h = 10,
+      color = '000000', fontSize = 18, bold = false, italic = false,
+      fontFamily = 'Calibri', bulletChar = '\u2022',
+      fill, align = 'start',
+    } = style;
+
+    const slide = this._slides[slideIdx];
+    if (!slide) throw new RangeError(`Slide ${slideIdx} out of range`);
+
+    const fillProp = fill
+      ? `draw:fill="solid" draw:fill-color="#${fill}"`
+      : 'draw:fill="none"';
+    const frameStyleName = this._addStyle('graphic',
+      `<style:graphic-properties ${fillProp} draw:stroke="none" draw:auto-grow-height="true"/>`);
+
+    // List style with bullet or number
+    const listStyleName = `L${++this._styleCounter}`;
+    const isNumbered = bulletChar === '1';
+    let listStyleXml;
+    if (isNumbered) {
+      listStyleXml = `<text:list-style style:name="${listStyleName}">` +
+        `<text:list-level-style-number text:level="1" text:style-name="Numbering_20_Symbols" style:num-format="1" text:start-value="1">` +
+        `<style:list-level-properties text:space-before="0.5cm" text:min-label-width="0.5cm"/>` +
+        `</text:list-level-style-number>` +
+        `</text:list-style>`;
+    } else if (bulletChar) {
+      listStyleXml = `<text:list-style style:name="${listStyleName}">` +
+        `<text:list-level-style-bullet text:level="1" text:bullet-char="${escXml(bulletChar)}">` +
+        `<style:list-level-properties text:space-before="0.5cm" text:min-label-width="0.5cm"/>` +
+        `</text:list-level-style-bullet>` +
+        `</text:list-style>`;
+    } else {
+      listStyleXml = `<text:list-style style:name="${listStyleName}"/>`;
+    }
+    this._styles.push({ name: listStyleName, family: '_list', propertiesXml: listStyleXml, rawXml: true });
+
+    const paraStyleName = this._addStyle('paragraph',
+      `<style:paragraph-properties fo:text-align="${align}" fo:margin-left="0cm" fo:text-indent="0cm"/>`);
+    const textStyleName = this._addStyle('text',
+      `<style:text-properties fo:font-size="${fontSize}pt" fo:color="#${color}"` +
+      (bold ? ' fo:font-weight="bold"' : '') +
+      (italic ? ' fo:font-style="italic"' : '') +
+      ` style:font-name="${escXml(fontFamily)}"/>`);
+
+    let listItemsXml = '';
+    for (const item of items) {
+      listItemsXml += `<text:list-item><text:p text:style-name="${paraStyleName}">` +
+        `<text:span text:style-name="${textStyleName}">${escXml(item)}</text:span>` +
+        `</text:p></text:list-item>`;
+    }
+
+    slide.shapes.push({
+      type: 'frame',
+      xml: `<draw:frame draw:style-name="${frameStyleName}" ` +
+           `svg:x="${cm(x)}" svg:y="${cm(y)}" svg:width="${cm(w)}" svg:height="${cm(h)}">` +
+           `<draw:text-box><text:list text:style-name="${listStyleName}">${listItemsXml}</text:list></draw:text-box>` +
            `</draw:frame>`,
     });
 
@@ -444,7 +755,12 @@ ${dpStyles}  </office:automatic-styles>
     // Automatic styles (shape styles)
     let autoStyles = '';
     for (const s of this._styles) {
-      autoStyles += `<style:style style:name="${s.name}" style:family="${s.family}">${s.propertiesXml}</style:style>\n`;
+      if (s.rawXml) {
+        // Raw XML (e.g. list styles) — inject directly
+        autoStyles += s.propertiesXml + '\n';
+      } else {
+        autoStyles += `<style:style style:name="${s.name}" style:family="${s.family}">${s.propertiesXml}</style:style>\n`;
+      }
     }
 
     // Drawing page styles inside content.xml automatic-styles
@@ -557,31 +873,8 @@ function _convertTextShape(writer, slide, sp) {
   const fullText = allT.map(t => t.textContent).join('');
   if (!fullText.trim()) return;
 
-  // Extract text formatting from first run
-  let fontSize = 18;
-  let fontFamily = 'Calibri';
-  let color = '000000';
-  let bold = false;
+  // Check paragraph alignment from the first paragraph
   let align = 'start';
-
-  const firstRun = _g1(txBody, 'r');
-  if (firstRun) {
-    const rPr = _g1(firstRun, 'rPr');
-    if (rPr) {
-      const sz = rPr.getAttribute('sz');
-      if (sz) fontSize = parseInt(sz, 10) / 100;
-      const b = rPr.getAttribute('b');
-      if (b === '1' || b === 'true') bold = true;
-
-      const srgb = _g1(rPr, 'srgbClr');
-      if (srgb) color = srgb.getAttribute('val') || '000000';
-
-      const latin = _g1(rPr, 'latin');
-      if (latin) fontFamily = latin.getAttribute('typeface') || 'Calibri';
-    }
-  }
-
-  // Check paragraph alignment
   const pPr = _g1(paragraphs[0], 'pPr');
   if (pPr) {
     const algn = pPr.getAttribute('algn');
@@ -590,7 +883,7 @@ function _convertTextShape(writer, slide, sp) {
     else if (algn === 'just') align = 'justify';
   }
 
-  // Build paragraph XML for each paragraph
+  // Build paragraph XML — preserve per-run formatting
   const frameStyleName = writer._addStyle(
     'graphic',
     `<style:graphic-properties draw:stroke="none" draw:fill="none" draw:auto-grow-height="true"/>`,
@@ -599,26 +892,44 @@ function _convertTextShape(writer, slide, sp) {
     'paragraph',
     `<style:paragraph-properties fo:text-align="${align}"/>`,
   );
-  const textStyleName = writer._addStyle(
-    'text',
-    `<style:text-properties fo:font-size="${fontSize}pt" fo:color="#${color}"` +
-    (bold ? ' fo:font-weight="bold"' : '') +
-    ` style:font-name="${escXml(fontFamily)}"/>`,
-  );
 
   let parasXml = '';
   for (const p of paragraphs) {
+    parasXml += `<text:p text:style-name="${paraStyleName}">`;
     const runs = _gtn(p, 'r');
-    let paraText = '';
     for (const r of runs) {
       const tEl = _g1(r, 't');
-      if (tEl && tEl.textContent) {
-        paraText += escXml(tEl.textContent);
+      if (!tEl || !tEl.textContent) continue;
+
+      // Extract per-run formatting
+      let fontSize = 18, fontFamily = 'Calibri', color = '000000';
+      let bold = false, italic = false, underline = false, strikethrough = false;
+      const rPr = _g1(r, 'rPr');
+      if (rPr) {
+        const sz = rPr.getAttribute('sz');
+        if (sz) fontSize = parseInt(sz, 10) / 100;
+        if (rPr.getAttribute('b') === '1' || rPr.getAttribute('b') === 'true') bold = true;
+        if (rPr.getAttribute('i') === '1' || rPr.getAttribute('i') === 'true') italic = true;
+        if (rPr.getAttribute('u') === 'sng') underline = true;
+        if (rPr.getAttribute('strike') === 'sngStrike') strikethrough = true;
+        const srgb = _g1(rPr, 'srgbClr');
+        if (srgb) color = srgb.getAttribute('val') || '000000';
+        const latin = _g1(rPr, 'latin');
+        if (latin) fontFamily = latin.getAttribute('typeface') || 'Calibri';
       }
+
+      const textStyleName = writer._addStyle(
+        'text',
+        `<style:text-properties fo:font-size="${fontSize}pt" fo:color="#${color}"` +
+        (bold ? ' fo:font-weight="bold"' : '') +
+        (italic ? ' fo:font-style="italic"' : '') +
+        (underline ? ' style:text-underline-style="solid" style:text-underline-width="auto"' : '') +
+        (strikethrough ? ' style:text-line-through-style="solid"' : '') +
+        ` style:font-name="${escXml(fontFamily)}"/>`,
+      );
+      parasXml += `<text:span text:style-name="${textStyleName}">${escXml(tEl.textContent)}</text:span>`;
     }
-    parasXml += `<text:p text:style-name="${paraStyleName}">` +
-      `<text:span text:style-name="${textStyleName}">${paraText}</text:span>` +
-      `</text:p>`;
+    parasXml += `</text:p>`;
   }
 
   slide.shapes.push({
