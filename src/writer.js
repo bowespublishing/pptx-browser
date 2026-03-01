@@ -179,6 +179,33 @@ function nextRId(rels) {
   return 'rId' + ((nums.length ? Math.max(...nums) : 0) + 1);
 }
 
+// ── Font embedding helpers ────────────────────────────────────────────────────
+
+/** Generate a random GUID string: {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}. */
+function _generateGuid() {
+  const hex = () => Math.floor(Math.random() * 0x10000).toString(16).padStart(4, '0');
+  return `{${hex()}${hex()}-${hex()}-${hex()}-${hex()}-${hex()}${hex()}${hex()}}`;
+}
+
+/** Derive the 32-byte XOR key from a GUID (ECMA-376 §15.2.12). */
+function _guidToKey(guid) {
+  const h = guid.replace(/[{}\-]/g, '');
+  const d1 = h.slice(0, 8), d2 = h.slice(8, 12), d3 = h.slice(12, 16), d4 = h.slice(16, 32);
+  const key = new Uint8Array(16);
+  // Data1 little-endian
+  key[0] = parseInt(d1.slice(6, 8), 16);  key[1] = parseInt(d1.slice(4, 6), 16);
+  key[2] = parseInt(d1.slice(2, 4), 16);  key[3] = parseInt(d1.slice(0, 2), 16);
+  // Data2 little-endian
+  key[4] = parseInt(d2.slice(2, 4), 16);  key[5] = parseInt(d2.slice(0, 2), 16);
+  // Data3 little-endian
+  key[6] = parseInt(d3.slice(2, 4), 16);  key[7] = parseInt(d3.slice(0, 2), 16);
+  // Data4 big-endian
+  for (let i = 0; i < 8; i++) key[8 + i] = parseInt(d4.slice(i * 2, i * 2 + 2), 16);
+  const key32 = new Uint8Array(32);
+  key32.set(key); key32.set(key, 16);
+  return key32;
+}
+
 // ── Shape lookup helpers ──────────────────────────────────────────────────────
 
 function findShapeByName(spTree, name) {
@@ -1639,6 +1666,128 @@ export class PptxWriter {
       fullPath: notesPath,
     };
     this._files[relsPath(slidePath)] = xmlBytes(buildRelsDoc(slideRels));
+  }
+
+  // ── Font embedding ──────────────────────────────────────────────────────────
+
+  /**
+   * Embed a font file (TTF, OTF, WOFF, WOFF2) directly into the PPTX.
+   *
+   * The font is stored as an embedded font resource inside the PPTX so that
+   * the exact typeface is available when the file is opened, even on systems
+   * that don't have the font installed.
+   *
+   * PowerPoint stores embedded fonts as .fntdata files in ppt/fonts/ with
+   * XOR obfuscation per ECMA-376 §15.2.12.
+   *
+   * @param {string} family — font family name as used in the presentation
+   * @param {ArrayBuffer|Uint8Array} fontBytes — raw TTF/OTF/WOFF/WOFF2 bytes
+   * @param {object} [opts]
+   * @param {string} [opts.weight='400']  — '400' (regular) or '700' (bold)
+   * @param {string} [opts.style='normal'] — 'normal' or 'italic'
+   * @returns {PptxWriter}
+   *
+   * @example
+   * const fontBuf = await fetch('/fonts/brand.ttf').then(r => r.arrayBuffer());
+   * writer.embedFont('Brand Sans', fontBuf);
+   * writer.embedFont('Brand Sans', boldBuf, { weight: '700' });
+   * writer.embedFont('Brand Sans', italicBuf, { style: 'italic' });
+   */
+  embedFont(family, fontBytes, opts = {}) {
+    const weight = opts.weight || '400';
+    const style  = opts.style  || 'normal';
+
+    const raw = fontBytes instanceof Uint8Array ? fontBytes : new Uint8Array(fontBytes);
+
+    // Determine variant slot name
+    const isBold   = weight === '700' || weight === 'bold';
+    const isItalic = style === 'italic';
+    let variant;
+    if (isBold && isItalic) variant = 'boldItalic';
+    else if (isBold)        variant = 'bold';
+    else if (isItalic)      variant = 'italic';
+    else                    variant = 'regular';
+
+    // Generate a GUID for the relationship
+    const guid = _generateGuid();
+
+    // Derive obfuscation key from GUID and XOR the first 32 bytes
+    const key32 = _guidToKey(guid);
+    const obfuscated = new Uint8Array(raw);
+    for (let i = 0; i < Math.min(32, obfuscated.length); i++) {
+      obfuscated[i] ^= key32[i];
+    }
+
+    // Store the font data in ppt/fonts/
+    const fontIdx = Object.keys(this._files).filter(p => p.startsWith('ppt/fonts/')).length + 1;
+    const fontPath = `ppt/fonts/font${fontIdx}.fntdata`;
+    this._files[fontPath] = obfuscated;
+
+    // Add content type for .fntdata
+    const ctDoc = readXml(this._files, '[Content_Types].xml');
+    if (ctDoc) {
+      const existing = [...ctDoc.documentElement.children].some(
+        el => el.getAttribute('Extension') === 'fntdata'
+      );
+      if (!existing) {
+        const defEl = ctDoc.createElementNS(NS.ct, 'Default');
+        defEl.setAttribute('Extension', 'fntdata');
+        defEl.setAttribute('ContentType', 'application/x-fontdata');
+        ctDoc.documentElement.appendChild(defEl);
+        this._files['[Content_Types].xml'] = xmlBytes(ctDoc);
+      }
+    }
+
+    // Add relationship in presentation.xml.rels
+    const newRId = nextRId(this._presRels);
+    this._presRels[newRId] = {
+      id: newRId,
+      type: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/font',
+      target: `fonts/font${fontIdx}.fntdata`,
+      fullPath: fontPath,
+    };
+    this._files[relsPath(this._presPath)] = xmlBytes(buildRelsDoc(this._presRels));
+
+    // Add <p:embeddedFont> entry in presentation.xml
+    let embFontLst = g1(this._presDoc, 'embeddedFontLst');
+    if (!embFontLst) {
+      embFontLst = this._presDoc.createElementNS(NS.p, 'p:embeddedFontLst');
+      // Insert after sldIdLst or at start of presentation
+      const sldIdLst = g1(this._presDoc, 'sldIdLst');
+      if (sldIdLst && sldIdLst.nextSibling) {
+        sldIdLst.parentNode.insertBefore(embFontLst, sldIdLst.nextSibling);
+      } else {
+        this._presDoc.documentElement.appendChild(embFontLst);
+      }
+    }
+
+    // Check if this family already has an embeddedFont element
+    let embFont = null;
+    for (const ef of [...embFontLst.children]) {
+      if (ef.localName !== 'embeddedFont') continue;
+      const fontEl = g1(ef, 'font');
+      if (fontEl && fontEl.getAttribute('typeface') === family) {
+        embFont = ef;
+        break;
+      }
+    }
+    if (!embFont) {
+      embFont = this._presDoc.createElementNS(NS.p, 'p:embeddedFont');
+      const fontEl = this._presDoc.createElementNS(NS.p, 'p:font');
+      fontEl.setAttribute('typeface', family);
+      embFont.appendChild(fontEl);
+      embFontLst.appendChild(embFont);
+    }
+
+    // Add variant element
+    const varEl = this._presDoc.createElementNS(NS.p, `p:${variant}`);
+    varEl.setAttributeNS(NS.r, 'r:id', newRId);
+    embFont.appendChild(varEl);
+
+    // Save updated presentation.xml
+    this._files[this._presPath] = xmlBytes(this._presDoc);
+
+    return this;
   }
 
   // ── Serialisation ─────────────────────────────────────────────────────────────

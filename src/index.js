@@ -43,6 +43,7 @@ import { extractSlide, extractAll, extractText, searchSlides } from './extract.j
 import { SlideShow } from './slideshow.js';
 import { copySlideToClipboard, downloadSlide, downloadAllSlides, createLazyDeck } from './clipboard.js';
 import { OdpWriter } from './odp.js';
+import { convertOdpFiles, isOdpFile } from './odp-reader.js';
 
 export default class PptxRenderer {
   constructor() {
@@ -67,12 +68,15 @@ export default class PptxRenderer {
      * @type {Array}
      */
     this.embeddedFonts = [];
+
+    /** True if the loaded file was an ODP (OpenDocument Presentation). */
+    this._isOdp = false;
   }
 
   // ── Loading ──────────────────────────────────────────────────────────────
 
   /**
-   * Load a PPTX file.
+   * Load a PPTX or ODP file.
    * @param {File|Blob|ArrayBuffer|Uint8Array} source
    * @param {(progress: number, message: string) => void} [onProgress]
    */
@@ -92,10 +96,21 @@ export default class PptxRenderer {
     onProgress(0.05, 'Decompressing…');
     this._files = await readZip(buf);
 
+    // ── ODP detection and conversion ─────────────────────────────────────
+    if (isOdpFile(this._files)) {
+      onProgress(0.08, 'Converting ODP…');
+      const odpResult = convertOdpFiles(this._files);
+      // convertOdpFiles injects synthetic PPTX files into this._files,
+      // so we can continue with the normal PPTX pipeline below.
+      this._isOdp = true;
+    } else {
+      this._isOdp = false;
+    }
+
     // ── presentation.xml ─────────────────────────────────────────────────
     onProgress(0.1, 'Parsing presentation…');
     const presXml = this._readText('ppt/presentation.xml');
-    if (!presXml) throw new Error('Invalid PPTX: missing ppt/presentation.xml');
+    if (!presXml) throw new Error('Invalid PPTX/ODP: missing presentation data');
     const presDoc = parseXml(presXml);
 
     const sldSz = g1(presDoc, 'sldSz');
@@ -684,6 +699,8 @@ export default class PptxRenderer {
       height: this.slideSize.cy / 914400,
       /** Aspect ratio (width / height) */
       aspectRatio: this.slideSize.cx / this.slideSize.cy,
+      /** Source format: 'pptx' or 'odp' */
+      format: this._isOdp ? 'odp' : 'pptx',
     };
   }
 
@@ -782,5 +799,6 @@ export { PptxWriter } from './writer.js';
 // PDF export
 export { exportToPdf, downloadAsPdf, exportSlideToPdf } from './pdf.js';
 
-// ODP (OpenDocument Presentation) writer
+// ODP (OpenDocument Presentation) writer + reader
 export { OdpWriter } from './odp.js';
+export { convertOdpFiles, isOdpFile } from './odp-reader.js';

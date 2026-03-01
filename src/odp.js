@@ -127,6 +127,8 @@ export class OdpWriter {
     this._defaultFont = 'Calibri';
     /** Default font size in pt */
     this._defaultFontSizePt = 18;
+    /** @type {Array<{family: string, path: string, weight: string, style: string}>} embedded fonts */
+    this._embeddedFonts = [];
   }
 
   /**
@@ -678,6 +680,40 @@ export class OdpWriter {
   // ── Serialisation ─────────────────────────────────────────────────────────
 
   /**
+   * Embed a font file (TTF, OTF, WOFF, WOFF2) directly into the ODP.
+   *
+   * The font is stored inside the ODP archive so that the exact typeface
+   * is available when the file is opened, even on systems that don't
+   * have the font installed.
+   *
+   * @param {string} family — font family name
+   * @param {ArrayBuffer|Uint8Array} fontBytes — raw font file bytes
+   * @param {object} [opts]
+   * @param {string} [opts.weight='400'] — '400' or '700'
+   * @param {string} [opts.style='normal'] — 'normal' or 'italic'
+   * @returns {OdpWriter}
+   *
+   * @example
+   * const buf = await fetch('/fonts/brand.ttf').then(r => r.arrayBuffer());
+   * odp.embedFont('Brand Sans', buf);
+   * odp.embedFont('Brand Sans', boldBuf, { weight: '700' });
+   */
+  embedFont(family, fontBytes, opts = {}) {
+    const weight = opts.weight || '400';
+    const style  = opts.style  || 'normal';
+    const raw = fontBytes instanceof Uint8Array ? fontBytes : new Uint8Array(fontBytes);
+
+    const idx = this._embeddedFonts.length + 1;
+    const ext = _detectFontExt(raw);
+    const fontPath = `Fonts/font${idx}.${ext}`;
+
+    this._media[fontPath] = raw;
+    this._embeddedFonts.push({ family, path: fontPath, weight, style });
+
+    return this;
+  }
+
+  /**
    * Serialize the ODP to bytes.
    * @returns {Promise<Uint8Array>}
    */
@@ -696,7 +732,7 @@ export class OdpWriter {
 
     for (const [path, bytes] of Object.entries(this._media)) {
       const ext = path.split('.').pop();
-      const mime = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml' }[ext] || 'application/octet-stream';
+      const mime = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', ttf: 'application/x-font-ttf', otf: 'application/x-font-opentype', woff: 'font/woff', woff2: 'font/woff2' }[ext] || 'application/octet-stream';
       manifestEntries += `<manifest:file-entry manifest:full-path="${escXml(path)}" manifest:media-type="${mime}"/>\n`;
     }
 
@@ -765,9 +801,35 @@ ${manifestEntries}</manifest:manifest>`);
       dpStyles += `<style:style style:name="dp${i}" style:family="drawing-page">${bgProp}</style:style>\n`;
     }
 
+    // Font face declarations for embedded fonts
+    let fontFaceDecls = '';
+    if (this._embeddedFonts.length > 0) {
+      fontFaceDecls = '<office:font-face-decls>\n';
+      // Group by family
+      const families = new Map();
+      for (const f of this._embeddedFonts) {
+        if (!families.has(f.family)) families.set(f.family, []);
+        families.get(f.family).push(f);
+      }
+      for (const [family, variants] of families) {
+        const srcEntries = variants.map(v => {
+          const mimeMap = { ttf: 'application/x-font-ttf', otf: 'application/x-font-opentype', woff: 'font/woff', woff2: 'font/woff2' };
+          const ext = v.path.split('.').pop();
+          const mime = mimeMap[ext] || 'application/x-font-ttf';
+          return `<svg:font-face-uri xlink:href="${escXml(v.path)}" xlink:type="simple" svg:format="${mime}"/>`;
+        }).join('\n          ');
+        fontFaceDecls += `  <style:font-face style:name="${escXml(family)}" svg:font-family="'${escXml(family)}'">
+    <svg:font-face-src>
+          ${srcEntries}
+    </svg:font-face-src>
+  </style:font-face>\n`;
+      }
+      fontFaceDecls += '</office:font-face-decls>\n';
+    }
+
     return `<?xml version="1.0" encoding="UTF-8"?>
 <office:document-styles ${nsDecls()}>
-  <office:styles>
+  ${fontFaceDecls}<office:styles>
     <style:style style:name="standard" style:family="graphic">
       <style:graphic-properties draw:stroke="none" draw:fill="none"/>
     </style:style>
@@ -829,6 +891,16 @@ ${pages}    </office:presentation>
 }
 
 // ── PPTX → ODP conversion helpers ──────────────────────────────────────────
+
+/** Detect font format from magic bytes. */
+function _detectFontExt(bytes) {
+  if (bytes.length < 4) return 'ttf';
+  const sig = (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
+  if (sig === 0x774F4646) return 'woff';
+  if (sig === 0x774F4632) return 'woff2';
+  if (sig === 0x4F54544F) return 'otf';  // 'OTTO'
+  return 'ttf';
+}
 
 function _g1(node, localName) {
   if (!node) return null;
