@@ -1,0 +1,53 @@
+{
+  "name": "pptx-browser",
+  "version": "4.1.5",
+  "description": "Render, edit, and export PowerPoint (PPTX) slides. Canvas rendering, SVG export, PDF export, PPTX writer/template engine, slide show, text extraction, animations. Zero dependencies.",
+  "type": "module",
+  "main": "./src/index.js",
+  "module": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./writer": "./src/writer.js",
+    "./pdf": "./src/pdf.js",
+    "./svg": "./src/svg.js",
+    "./animation": "./src/animation.js",
+    "./slideshow": "./src/slideshow.js",
+    "./extract": "./src/extract.js",
+    "./clipboard": "./src/clipboard.js",
+    "./zip-writer": "./src/zip-writer.js"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pptx",
+    "powerpoint",
+    "canvas",
+    "pdf",
+    "svg",
+    "presentation",
+    "renderer",
+    "editor",
+    "template"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "esbuild": "^0.20.0"
+  },
+  "scripts": {
+    "build": "esbuild src/index.js --bundle --format=esm --outfile=dist/pptx-canvas-renderer.esm.js && esbuild src/index.js --bundle --format=iife --global-name=PptxCanvasRenderer --outfile=dist/pptx-canvas-renderer.umd.js",
+    "build:esm": "esbuild src/index.js --bundle --format=esm --outfile=dist/pptx-canvas-renderer.esm.js",
+    "build:umd": "esbuild src/index.js --bundle --format=iife --global-name=PptxCanvasRenderer --outfile=dist/pptx-canvas-renderer.umd.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "browser": {
+    "./src/index.js": "./src/index.js"
+  },
+  "sideEffects": false
+}
